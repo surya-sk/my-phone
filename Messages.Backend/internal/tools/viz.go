@@ -1,0 +1,208 @@
+package tools
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/maxghenis/openmessage/internal/viz"
+)
+
+func generateVizTool() mcp.Tool {
+	return mcp.NewTool("generate_viz",
+		mcp.WithDescription("Generate a self-contained HTML visualization of a relationship. Combines data dashboards (charts, heatmap, phrase cloud) with narrative chapters. Output is a single HTML file deployable to Vercel or viewable locally."),
+		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
+		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under OPENMESSAGES_EXPORT_DIR or ~/Documents/OpenMessage; set OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
+		mcp.WithString("person1", mcp.Description("First person's display name (default: 'Max')")),
+		mcp.WithString("person2", mcp.Description("Second person's display name (default: matched name)")),
+		mcp.WithString("timezone", mcp.Description("Timezone for heatmap and dates (default: America/New_York)")),
+		mcp.WithString("password", mcp.Description("Password to protect the viz (will be SHA-256 hashed client-side). Empty = no gate.")),
+		mcp.WithString("primary_color", mcp.Description("Primary CSS color for person2 (e.g. '#be123c')")),
+		mcp.WithString("secondary_color", mcp.Description("Secondary CSS color for person1 (e.g. '#d97706')")),
+		mcp.WithString("accent_color", mcp.Description("Accent CSS color (e.g. '#fbbf24')")),
+		mcp.WithString("background_color", mcp.Description("Background CSS color (e.g. '#0c0a09')")),
+		mcp.WithString("style", mcp.Description("Story style: intimate, professional, friendship (default: auto-detect)")),
+		mcp.WithString("api_key", mcp.Description("Anthropic API key for AI-generated narrative (without it, generates stats + sampled quotes)")),
+		mcp.WithDestructiveHintAnnotation(false),
+	)
+}
+
+func generateVizHandler(a *app.App) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+		name := strArg(args, "name")
+		if name == "" {
+			return errorResult("name is required"), nil
+		}
+		outputPath := strArg(args, "output_path")
+		if outputPath == "" {
+			return errorResult("output_path is required"), nil
+		}
+		outputPath, err := resolveExportWritePath(outputPath)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
+
+		// Collect messages across all platforms
+		msgs, convNames, err := collectPersonMessages(a, name)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
+		if len(msgs) == 0 {
+			return textResult(fmt.Sprintf("No messages found with '%s'.", name)), nil
+		}
+
+		// Parse timezone
+		tzName := strArg(args, "timezone")
+		if tzName == "" {
+			tzName = "America/New_York"
+		}
+		tz, err := time.LoadLocation(tzName)
+		if err != nil {
+			return errorResult(fmt.Sprintf("invalid timezone %q: %v", tzName, err)), nil
+		}
+
+		// Compute stats with timezone
+		stats := story.ComputeStats(msgs, tz)
+
+		// Generate narrative
+		style := strArg(args, "style")
+		apiKey := strArg(args, "api_key")
+		st, err := story.Generate(msgs, story.GenerateConfig{
+			Style:             style,
+			APIKey:            apiKey,
+			MaxSampleMessages: 200,
+		})
+		if err != nil {
+			return errorResult(fmt.Sprintf("generate story: %v", err)), nil
+		}
+		// Use the stats we computed with timezone
+		st.Stats = stats
+
+		// Find media messages
+		mediaMessages := viz.FindMediaMessages(msgs)
+
+		// Build config
+		person1 := strArg(args, "person1")
+		if person1 == "" {
+			person1 = "Max"
+		}
+		person2 := strArg(args, "person2")
+		if person2 == "" {
+			// Use the matched name from conversations
+			for sender := range stats.SenderSplit {
+				if sender != "me" {
+					person2 = sender
+					break
+				}
+			}
+			if person2 == "" {
+				person2 = name
+			}
+		}
+
+		config := viz.VizConfig{
+			Person1:         person1,
+			Person2:         person2,
+			PrimaryColor:    safeCSSColor(strArg(args, "primary_color")),
+			SecondaryColor:  safeCSSColor(strArg(args, "secondary_color")),
+			AccentColor:     safeCSSColor(strArg(args, "accent_color")),
+			BackgroundColor: safeCSSColor(strArg(args, "background_color")),
+			Timezone:        tzName,
+			PasswordHash:    hashPassword(strArg(args, "password")),
+		}
+
+		// Render HTML
+		html, err := viz.RenderHTML(stats, st, config)
+		if err != nil {
+			return errorResult(fmt.Sprintf("render HTML: %v", err)), nil
+		}
+
+		// Write the file
+		if err := writePrivateExportFile(outputPath, html); err != nil {
+			return errorResult(fmt.Sprintf("write file: %v", err)), nil
+		}
+
+		// Build summary
+		fileInfo, _ := os.Stat(outputPath)
+		sizeKB := 0
+		if fileInfo != nil {
+			sizeKB = int(fileInfo.Size() / 1024)
+		}
+
+		summary := fmt.Sprintf("Visualization generated!\n\n"+
+			"Output: %s (%d KB)\n"+
+			"Person: %s & %s\n"+
+			"Messages: %d across %d conversation(s)\n"+
+			"Conversations: %s\n"+
+			"Date range: %s to %s\n"+
+			"Timezone: %s\n"+
+			"Media messages found: %d\n"+
+			"Chapters: %d\n",
+			outputPath, sizeKB,
+			person1, person2,
+			stats.TotalMessages, len(convNames),
+			joinNames(convNames),
+			stats.DateRange.Start, stats.DateRange.End,
+			tzName,
+			len(mediaMessages),
+			len(st.Chapters),
+		)
+
+		if config.PasswordHash != "" {
+			summary += "Password gate: enabled\n"
+		}
+
+		return textResult(summary), nil
+	}
+}
+
+// hashPassword returns the SHA-256 hex digest of a password, or empty if password is empty.
+func hashPassword(pw string) string {
+	if pw == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(pw))
+	return hex.EncodeToString(h[:])
+}
+
+func joinNames(names []string) string {
+	if len(names) > 3 {
+		return fmt.Sprintf("%s, %s, %s, +%d more", names[0], names[1], names[2], len(names)-3)
+	}
+	return strings.Join(names, ", ")
+}
+
+var (
+	hexColorRE     = regexp.MustCompile(`^#[0-9a-fA-F]{3,8}$`)
+	cssColorNameRE = regexp.MustCompile(`^[a-zA-Z]{3,20}$`)
+)
+
+// safeCSSColor validates a caller-supplied color before it's interpolated into
+// the generated viz HTML's CSS. It accepts hex colors (#rgb…#rrggbbaa) and bare
+// alphabetic CSS color names, and rejects anything else — so a value like
+// "red;}body{...}" can't break out of the CSS declaration and inject rules.
+// Returns "" for invalid input so the template falls back to its defaults.
+func safeCSSColor(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if hexColorRE.MatchString(s) {
+		return s
+	}
+	if cssColorNameRE.MatchString(s) {
+		return strings.ToLower(s)
+	}
+	return ""
+}

@@ -1,0 +1,321 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+            <SolidColorBrush x:Key="MetroSelectedBrush" Color="{ThemeResource SystemAccentColor}" Opacity="0.16" />
+            <SolidColorBrush x:Key="MetroAccentBrush" Color="{ThemeResource SystemAccentColorDark1}" />
+            <SolidColorBrush x:Key="MetroAccentTextBrush" Color="{ThemeResource SystemAccentColorDark1}" />
+            <SolidColorBrush x:Key="IncomingBubbleBrush" Color="#FFFFFFFF" />
+            <SolidColorBrush x:Key="IncomingBubbleTextBrush" Color="#FF1A1A1A" />
+            <SolidColorBrush x:Key="PaneBrush" Color="#59FFFFFF" />
+            <SolidColorBrush x:Key="DividerBrush" Color="#1A000000" />
+            <SolidColorBrush x:Key="QuoteIncomingBrush" Color="#0F000000" />
+            <SolidColorBrush x:Key="ChipBrush" Color="#F2FFFFFF" />
+            <SolidColorBrush x:Key="FailedBrush" Color="#FFC42B1C" />
+            <SolidColorBrush x:Key="PlaceholderTileBrush" Color="#14000000" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+            <SolidColorBrush x:Key="MetroSelectedBrush" Color="{ThemeResource SystemAccentColor}" Opacity="0.32" />
+            <SolidColorBrush x:Key="MetroAccentBrush" Color="{ThemeResource SystemAccentColorDark1}" />
+            <SolidColorBrush x:Key="MetroAccentTextBrush" Color="{ThemeResource SystemAccentColorLight2}" />
+            <SolidColorBrush x:Key="IncomingBubbleBrush" Color="#FF2E2E2E" />
+            <SolidColorBrush x:Key="IncomingBubbleTextBrush" Color="#FFFFFFFF" />
+            <SolidColorBrush x:Key="PaneBrush" Color="#33000000" />
+            <SolidColorBrush x:Key="DividerBrush" Color="#1FFFFFFF" />
+            <SolidColorBrush x:Key="QuoteIncomingBrush" Color="#14FFFFFF" />
+            <SolidColorBrush x:Key="ChipBrush" Color="#FF333333" />
+            <SolidColorBrush x:Key="FailedBrush" Color="#FFFF99A4" />
+            <SolidColorBrush x:Key="PlaceholderTileBrush" Color="#1AFFFFFF" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="HighContrast">
+            <SolidColorBrush x:Key="MetroSelectedBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+            <SolidColorBrush x:Key="MetroAccentBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+            <SolidColorBrush x:Key="MetroAccentTextBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+            <SolidColorBrush x:Key="IncomingBubbleBrush" Color="{ThemeResource SystemColorWindowColor}" />
+            <SolidColorBrush x:Key="IncomingBubbleTextBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+            <SolidColorBrush x:Key="PaneBrush" Color="{ThemeResource SystemColorWindowColor}" />
+            <SolidColorBrush x:Key="DividerBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+            <SolidColorBrush x:Key="QuoteIncomingBrush" Color="{ThemeResource SystemColorWindowColor}" />
+            <SolidColorBrush x:Key="ChipBrush" Color="{ThemeResource SystemColorWindowColor}" />
+            <SolidColorBrush x:Key="FailedBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+            <SolidColorBrush x:Key="PlaceholderTileBrush" Color="{ThemeResource SystemColorWindowColor}" />
+        </ResourceDictionary>
+    </ResourceDictionary.ThemeDictionaries>
+
+    <!-- Metro is square: no rounding on controls, flyouts, dialogs or menus. -->
+    <CornerRadius x:Key="ControlCornerRadius">0</CornerRadius>
+    <CornerRadius x:Key="OverlayCornerRadius">0</CornerRadius>
+    <CornerRadius x:Key="ListViewItemCornerRadius">0</CornerRadius>
+
+    <FontFamily x:Key="MetroDisplayFont">Segoe UI Variable Display, Segoe UI</FontFamily>
+    <FontFamily x:Key="MetroTextFont">Segoe UI Variable Text, Segoe UI</FontFamily>
+    <FontFamily x:Key="EmojiFont">Segoe UI Emoji</FontFamily>
+
+
+
+    <!-- Typography: big, light, lowercase headers. -->
+    <Style x:Key="MetroHeaderText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource MetroDisplayFont}" />
+        <Setter Property="FontWeight" Value="Light" />
+        <Setter Property="FontSize" Value="44" />
+        <Setter Property="LineHeight" Value="48" />
+        <Setter Property="TextLineBounds" Value="Tight" />
+        <Setter Property="OpticalMarginAlignment" Value="TrimSideBearings" />
+    </Style>
+    <Style x:Key="MetroSubheaderText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource MetroDisplayFont}" />
+        <Setter Property="FontWeight" Value="Light" />
+        <Setter Property="FontSize" Value="30" />
+        <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+        <Setter Property="OpticalMarginAlignment" Value="TrimSideBearings" />
+    </Style>
+    <Style x:Key="MetroCaptionText" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Opacity" Value="0.62" />
+    </Style>
+
+    <Style x:Key="PairingStepNumberStyle" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="{ThemeResource MetroAccentTextBrush}" />
+    </Style>
+
+    <!-- Windows 8 app-bar button: glyph inside a 2px ring. -->
+    <Style x:Key="CircleButtonStyle" TargetType="Button">
+        <Setter Property="Width" Value="40" />
+        <Setter Property="Height" Value="40" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="{ThemeResource TextFillColorPrimaryBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource TextFillColorPrimaryBrush}" />
+        <Setter Property="FontFamily" Value="{ThemeResource SymbolThemeFontFamily}" />
+        <Setter Property="FontSize" Value="14" />
+        <Setter Property="UseSystemFocusVisuals" Value="True" />
+        <Setter Property="FocusVisualMargin" Value="-3" />
+        <Setter Property="IsTabStop" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid x:Name="RootGrid" Background="Transparent">
+                        <Ellipse x:Name="Ring" Fill="{TemplateBinding Background}" Stroke="{TemplateBinding BorderBrush}" StrokeThickness="2" />
+                        <ContentPresenter x:Name="ContentPresenter" Content="{TemplateBinding Content}"
+                                          Foreground="{TemplateBinding Foreground}" FontFamily="{TemplateBinding FontFamily}"
+                                          FontSize="{TemplateBinding FontSize}"
+                                          HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="Ring.Fill" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="Ring.Fill" Value="{ThemeResource TextFillColorPrimaryBrush}" />
+                                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource SolidBackgroundFillColorBaseBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Disabled">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootGrid.Opacity" Value="0.35" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="AccentCircleButtonStyle" TargetType="Button" BasedOn="{StaticResource CircleButtonStyle}">
+        <Setter Property="Background" Value="{ThemeResource MetroAccentBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource MetroAccentBrush}" />
+        <Setter Property="Foreground" Value="White" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid x:Name="RootGrid" Background="Transparent">
+                        <Ellipse x:Name="Ring" Fill="{TemplateBinding Background}" Stroke="{TemplateBinding BorderBrush}" StrokeThickness="2" />
+                        <ContentPresenter x:Name="ContentPresenter" Content="{TemplateBinding Content}"
+                                          Foreground="{TemplateBinding Foreground}" FontFamily="{TemplateBinding FontFamily}"
+                                          FontSize="{TemplateBinding FontSize}"
+                                          HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootGrid.Opacity" Value="0.85" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootGrid.Opacity" Value="0.7" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Disabled">
+                                    <VisualState.Setters>
+                                        <Setter Target="Ring.Fill" Value="Transparent" />
+                                        <Setter Target="Ring.Stroke" Value="{ThemeResource TextFillColorDisabledBrush}" />
+                                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TextFillColorDisabledBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="LightCircleButtonStyle" TargetType="Button" BasedOn="{StaticResource CircleButtonStyle}">
+        <Setter Property="Foreground" Value="White" />
+        <Setter Property="BorderBrush" Value="White" />
+        <Setter Property="RequestedTheme" Value="Dark" />
+    </Style>
+
+    <!-- Pivot-style text header used for the inbox filters. -->
+    <Style x:Key="PivotHeaderButtonStyle" TargetType="Button">
+        <Setter Property="Padding" Value="0,0,20,0" />
+        <Setter Property="FontFamily" Value="{StaticResource MetroDisplayFont}" />
+        <Setter Property="FontWeight" Value="SemiLight" />
+        <Setter Property="FontSize" Value="21" />
+        <Setter Property="Foreground" Value="{ThemeResource TextFillColorPrimaryBrush}" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="UseSystemFocusVisuals" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <ContentPresenter x:Name="ContentPresenter" Background="Transparent" Padding="{TemplateBinding Padding}"
+                                      Content="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"
+                                      FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}"
+                                      FontWeight="{TemplateBinding FontWeight}">
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource MetroAccentTextBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="ContentPresenter.Opacity" Value="0.6" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </ContentPresenter>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Flat text link-style button. -->
+    <Style x:Key="FlatTextButtonStyle" TargetType="Button">
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Foreground" Value="{ThemeResource TextFillColorPrimaryBrush}" />
+        <Setter Property="UseSystemFocusVisuals" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid x:Name="RootGrid" Background="{TemplateBinding Background}">
+                        <ContentPresenter x:Name="ContentPresenter" Padding="{TemplateBinding Padding}"
+                                          Content="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"
+                                          HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}" />
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootGrid.Background" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootGrid.Background" Value="{ThemeResource SubtleFillColorTertiaryBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Square, chrome-less flyout used for the message menu. -->
+    <Style x:Key="MetroFlyoutPresenterStyle" TargetType="FlyoutPresenter">
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="MinWidth" Value="0" />
+        <Setter Property="MinHeight" Value="0" />
+        <Setter Property="CornerRadius" Value="0" />
+        <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Disabled" />
+        <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled" />
+    </Style>
+
+    <!-- Flat square list rows with an accent wash for the selection. -->
+    <Style x:Key="MetroListItemStyle" TargetType="ListViewItem">
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Margin" Value="0" />
+        <Setter Property="MinHeight" Value="0" />
+        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        <Setter Property="VerticalContentAlignment" Value="Stretch" />
+        <Setter Property="UseSystemFocusVisuals" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListViewItem">
+                    <ListViewItemPresenter
+                        ContentTransitions="{TemplateBinding ContentTransitions}"
+                        Control.IsTemplateFocusTarget="True"
+                        FocusVisualMargin="{TemplateBinding FocusVisualMargin}"
+                        SelectionCheckMarkVisualEnabled="False"
+                        SelectionIndicatorVisualEnabled="False"
+                        PointerOverBackground="{ThemeResource SubtleFillColorSecondaryBrush}"
+                        PressedBackground="{ThemeResource SubtleFillColorTertiaryBrush}"
+                        SelectedBackground="{ThemeResource MetroSelectedBrush}"
+                        SelectedPointerOverBackground="{ThemeResource MetroSelectedBrush}"
+                        SelectedPressedBackground="{ThemeResource MetroSelectedBrush}"
+                        Background="{TemplateBinding Background}"
+                        ContentMargin="{TemplateBinding Padding}"
+                        HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                        VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                        CornerRadius="0" />
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Transcript rows: no hover or selection chrome. -->
+    <Style x:Key="TranscriptItemStyle" TargetType="ListViewItem">
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Margin" Value="0" />
+        <Setter Property="MinHeight" Value="0" />
+        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        <Setter Property="IsTabStop" Value="False" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListViewItem">
+                    <ListViewItemPresenter
+                        ContentTransitions="{TemplateBinding ContentTransitions}"
+                        SelectionCheckMarkVisualEnabled="False"
+                        SelectionIndicatorVisualEnabled="False"
+                        PointerOverBackground="Transparent"
+                        PressedBackground="Transparent"
+                        SelectedBackground="Transparent"
+                        SelectedPointerOverBackground="Transparent"
+                        SelectedPressedBackground="Transparent"
+                        Background="Transparent"
+                        ContentMargin="{TemplateBinding Padding}"
+                        HorizontalContentAlignment="Stretch"
+                        VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                        CornerRadius="0" />
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+</ResourceDictionary>

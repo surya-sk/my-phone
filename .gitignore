@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+.vs/
+.build/
+dist/
+*.user
+# Local Go toolchain (see README: Runtime and build)
+Messages.Tools/
+# Upstream openmessage git history for the vendored backend (kept locally only)
+.upstream/

@@ -1,0 +1,4550 @@
+package signallive
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/rs/zerolog"
+	"rsc.io/qr"
+
+	"github.com/maxghenis/openmessage/internal/db"
+)
+
+const (
+	receiveTimeoutSeconds = 2
+	receiveMaxMessages    = 100
+	receiveFailureLimit   = 3
+	receivePoisonLimit    = 2
+	receiveRecoveryWindow = 30 * time.Second
+	reactionMatchWindow   = 15 * time.Second
+	sendTimeout           = 20 * time.Second
+	syncRequestTimeout    = 10 * time.Second
+	postLinkProbeTimeout  = 5 * time.Second
+	versionProbeTimeout   = 5 * time.Second
+	historySyncQuietAfter = 45 * time.Second
+
+	// receiveAccountInvalidLimit is how many consecutive receive attempts must
+	// report an account-invalid error ("not registered" / "authorization
+	// failed" / "invalid account") before the generation parks reauth. Receive
+	// errors are server-backed evidence, so the bar stays low — a genuinely
+	// unlinked account fails every attempt and still parks within seconds —
+	// but a single glitched invocation can no longer latch a permanent park.
+	receiveAccountInvalidLimit = 2
+
+	// accountProbeAttemptTimeout bounds one listAccounts invocation inside the
+	// receive-start probe. The probe used to run on the bare generation
+	// context; a signal-cli hang (account-db contention) would stall the
+	// generation instead of failing an attempt that the retry loop can pace.
+	accountProbeAttemptTimeout = 30 * time.Second
+
+	// accountUnreadableStreakLimit is how many consecutive generations the
+	// local account probe must stay empty — while accounts.json still lists a
+	// linked account — before the bridge parks reauth under
+	// SignalAccountUnreadableFingerprint. One empty probe is routine at boot
+	// (signal-cli races its own account bootstrap); a persistent
+	// listAccounts/accounts.json disagreement is real and must still surface.
+	accountUnreadableStreakLimit = 3
+
+	signalGetSenderPoisonFingerprint = "incoming_message_get_sender_content_null"
+)
+
+var minimumSignalCLIVersion = signalCLIVersion{major: 0, minor: 14, patch: 5}
+
+type signalCLIVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func parseSignalCLIVersion(output []byte) (signalCLIVersion, bool) {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(sanitizeSignalOutput(line))
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] != "signal-cli" {
+				continue
+			}
+			parts := strings.Split(fields[i+1], ".")
+			if len(parts) != 3 {
+				continue
+			}
+			major, majorErr := strconv.Atoi(parts[0])
+			minor, minorErr := strconv.Atoi(parts[1])
+			patch, patchErr := strconv.Atoi(parts[2])
+			if majorErr == nil && minorErr == nil && patchErr == nil {
+				return signalCLIVersion{major: major, minor: minor, patch: patch}, true
+			}
+		}
+	}
+	return signalCLIVersion{}, false
+}
+
+func (v signalCLIVersion) less(other signalCLIVersion) bool {
+	if v.major != other.major {
+		return v.major < other.major
+	}
+	if v.minor != other.minor {
+		return v.minor < other.minor
+	}
+	return v.patch < other.patch
+}
+
+func (v signalCLIVersion) String() string {
+	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
+}
+
+func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
+	if len(bytes.TrimSpace(output)) != 0 {
+		return false
+	}
+	return timedOut || errors.Is(err, context.DeadlineExceeded)
+}
+
+var (
+	now = time.Now
+
+	// accountProbeRetryDelays paces the in-generation listAccounts retries: a
+	// transient failure of signal-cli's per-account check (network not up at
+	// login-time autostart, a server hiccup) reports zero accounts with exit 0
+	// (observed live 2026-07-24 and 2026-08-06: empty probe, link intact) and
+	// usually recovers within seconds. Swapped by tests to keep them fast.
+	accountProbeRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second}
+
+	signalCLILookPath     = exec.LookPath
+	signalCLIStat         = os.Stat
+	probeSignalCLIVersion = func(ctx context.Context) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, signalCLIExecutable(), "--version")
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+			defer cleanupTmp()
+		}
+		configureSignalCancel(cmd)
+		return cmd.CombinedOutput()
+	}
+
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		commandArgs := append([]string{"--config", configDir}, args...)
+		cmd := exec.CommandContext(ctx, signalCLIExecutable(), commandArgs...)
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+			defer cleanupTmp()
+		}
+		configureSignalCancel(cmd)
+		return cmd.CombinedOutput()
+	}
+
+	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
+		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+		}
+		configureSignalCancel(cmd)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			if tmpErr == nil {
+				cleanupTmp()
+			}
+			return nil, nil, err
+		}
+		if err := cmd.Start(); err != nil {
+			if tmpErr == nil {
+				cleanupTmp()
+			}
+			return nil, nil, err
+		}
+		wait := func() error {
+			err := cmd.Wait()
+			if tmpErr == nil {
+				cleanupTmp()
+			}
+			return err
+		}
+		return stdout, wait, nil
+	}
+)
+
+// configureSignalCancel asks for a graceful stop before the hard kill so
+// the JVM gets a chance to run its shutdown hooks (which include libsignal
+// temp cleanup) and flush output when a context deadline fires.
+func configureSignalCancel(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = 3 * time.Second
+}
+
+type Callbacks struct {
+	OnConversationsChange func()
+	OnIncomingMessage     func(*db.Message)
+	OnMessagesChange      func(string)
+	OnStatusChange        func()
+	OnTypingChange        func(conversationID, senderName, senderNumber string, typing bool)
+}
+
+// PollerFailureKind is the transport-local terminal classification emitted by
+// the retained signal-cli receive poller. The bridge adapter translates these
+// values to bridge.FailureClass without making signallive depend on the generic
+// bridge package.
+type PollerFailureKind string
+
+const (
+	PollerFailureTransient PollerFailureKind = "transient"
+	PollerFailureReauth    PollerFailureKind = "reauth_required"
+	PollerFailureUpgrade   PollerFailureKind = "upgrade_required"
+	PollerFailureUnpaired  PollerFailureKind = "unpaired"
+)
+
+const (
+	SignalCLIVersionFingerprint        = "signal_cli_too_old"
+	SignalAccountInvalidFingerprint    = "signal_account_invalid"
+	SignalReceiveFailureFingerprint    = "signal_receive_failed"
+	SignalAccountProbeFingerprint      = "signal_account_probe_failed"
+	SignalReceivePanicFingerprint      = "signal_receive_panic"
+	SignalPairingIncompleteFingerprint = "signal_pairing_incomplete"
+
+	// SignalAccountProbeEmptyFingerprint marks a transient generation exit
+	// where listAccounts succeeded but reported no accounts while
+	// accounts.json still lists a linked one. The supervisor retries it on
+	// ordinary backoff; it never trips the non-transient circuit.
+	SignalAccountProbeEmptyFingerprint = "signal_account_probe_empty"
+
+	// SignalAccountUnreadableFingerprint marks the reauth park reached only
+	// after accountUnreadableStreakLimit consecutive generations of the probe
+	// disagreeing with accounts.json. Unlike SignalAccountInvalidFingerprint
+	// (server-backed receive failures, or an account missing from disk too)
+	// its evidence is an ambiguous empty listAccounts — a transient failure
+	// of signal-cli's account check looks identical to a deregistered device
+	// — so the cmd-layer park retest is allowed to re-probe it periodically
+	// instead of waiting forever for a manual /api/signal/connect. A genuine
+	// deregistration stays cheap under that retest: signal-cli persists
+	// "registered": false after the server 403, and every later probe fails
+	// locally without network traffic.
+	SignalAccountUnreadableFingerprint = "signal_account_unreadable"
+)
+
+// PollerExit is the terminal result of exactly one retained poller lifecycle.
+// A zero Kind is a caller-requested stop.
+type PollerExit struct {
+	Kind        PollerFailureKind
+	Operation   string
+	Fingerprint string
+	Err         error
+}
+
+// PollerActivity is evidence that the retained receive machinery advanced.
+// Expected idle completions count: they prove signal-cli returned control to
+// the poller even when the account had no incoming messages.
+type PollerActivity struct {
+	At     time.Time
+	Detail string
+}
+
+// PollerRun is a token-bound view of one link/probe/receive generation. Done
+// resolves only after the existing link/receive goroutine has returned.
+type PollerRun interface {
+	Ready() <-chan struct{}
+	Activity() <-chan PollerActivity
+	Done() <-chan PollerExit
+	Stop(context.Context) error
+}
+
+type pollerRun struct {
+	ready       chan struct{}
+	activity    chan PollerActivity
+	done        chan PollerExit
+	stopped     chan struct{}
+	cancel      context.CancelFunc
+	readyOnce   sync.Once
+	finishOnce  sync.Once
+	stoppedOnce sync.Once
+}
+
+func newPollerRun(parent context.Context) (*pollerRun, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &pollerRun{
+		ready:    make(chan struct{}),
+		activity: make(chan PollerActivity, 1),
+		done:     make(chan PollerExit, 1),
+		stopped:  make(chan struct{}),
+		cancel:   cancel,
+	}, ctx
+}
+
+func (r *pollerRun) Ready() <-chan struct{} { return r.ready }
+
+func (r *pollerRun) Activity() <-chan PollerActivity { return r.activity }
+
+func (r *pollerRun) Done() <-chan PollerExit { return r.done }
+
+func (r *pollerRun) Stop(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("signal poller: nil stop context")
+	}
+	r.cancel()
+	select {
+	case <-r.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *pollerRun) markReady() {
+	r.readyOnce.Do(func() { close(r.ready) })
+}
+
+func (r *pollerRun) beat(detail string) {
+	activity := PollerActivity{At: now(), Detail: detail}
+	select {
+	case r.activity <- activity:
+		return
+	default:
+	}
+	select {
+	case <-r.activity:
+	default:
+	}
+	select {
+	case r.activity <- activity:
+	default:
+	}
+}
+
+func (r *pollerRun) finish(exit PollerExit) {
+	r.finishOnce.Do(func() {
+		r.done <- exit
+		close(r.done)
+		close(r.activity)
+	})
+}
+
+func (r *pollerRun) markStopped() {
+	r.stoppedOnce.Do(func() { close(r.stopped) })
+}
+
+type StatusSnapshot struct {
+	Connected       bool   `json:"connected"`
+	Connecting      bool   `json:"connecting"`
+	Paired          bool   `json:"paired"`
+	Pairing         bool   `json:"pairing"`
+	Account         string `json:"account,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
+	QRAvailable     bool   `json:"qr_available"`
+	QRUpdatedAt     int64  `json:"qr_updated_at,omitempty"`
+	UpgradeRequired bool   `json:"upgrade_required,omitempty"`
+	// NeedsReauth is set when signal-cli reports that the stored account is
+	// no longer registered / authorized (e.g. user re-registered Signal on a
+	// new phone, or the linked device was unlinked remotely). When true,
+	// automatic reconnects stop — the user has to visit Platforms and
+	// re-pair manually. The UI should surface this prominently; otherwise
+	// Signal silently stops receiving with no indication. The one exception
+	// is the signal_account_unreadable park, whose only evidence is local
+	// (signal-cli could not read an account that accounts.json still lists):
+	// the cmd-layer park retest re-probes that state on a slow cadence, so a
+	// transient false park heals without a manual /api/signal/connect.
+	NeedsReauth     bool                   `json:"needs_reauth,omitempty"`
+	HistorySync     *HistorySyncSnapshot   `json:"history_sync,omitempty"`
+	ReceiveRecovery *ReceiveRecoveryStatus `json:"receive_recovery,omitempty"`
+}
+
+type HistorySyncSnapshot struct {
+	Running               bool  `json:"running"`
+	StartedAt             int64 `json:"started_at,omitempty"`
+	CompletedAt           int64 `json:"completed_at,omitempty"`
+	ImportedConversations int   `json:"imported_conversations,omitempty"`
+	ImportedMessages      int   `json:"imported_messages,omitempty"`
+}
+
+type ReceiveRecoveryStatus struct {
+	PendingCount    int    `json:"pending_count"`
+	LastIssueAt     int64  `json:"last_issue_at,omitempty"`
+	LastIssueReason string `json:"last_issue_reason,omitempty"`
+}
+
+type QRSnapshot struct {
+	UpdatedAt  int64  `json:"updated_at,omitempty"`
+	PNGDataURL string `json:"png_data_url,omitempty"`
+
+	URI string `json:"-"`
+}
+
+type participantJSON struct {
+	Name   string `json:"name"`
+	Number string `json:"number"`
+	IsMe   bool   `json:"is_me,omitempty"`
+}
+
+type storedReaction struct {
+	Emoji  string   `json:"emoji"`
+	Count  int      `json:"count"`
+	Actors []string `json:"actors,omitempty"`
+}
+
+type Bridge struct {
+	mu         sync.RWMutex
+	commandMu  sync.Mutex
+	recoveryMu sync.Mutex
+
+	store     *db.Store
+	logger    zerolog.Logger
+	configDir string
+	callbacks Callbacks
+
+	ingressObserver   func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressObserverID uint64
+
+	connected  bool
+	connecting bool
+	pairing    bool
+	account    string
+	lastError  string
+	qr         QRSnapshot
+	// needsReauth is set when signal-cli reports the stored account is no
+	// longer registered / authorized. Cleared on successful pair or
+	// reconnect. While set, the lifecycle reports reauth_required so the
+	// supervisor parks instead of retrying a known-bad account.
+	needsReauth bool
+	// upgradeRequired is a terminal receive state for an unsupported
+	// signal-cli version or its known poison-envelope crash. Automatic
+	// reconnects stay parked until a manual connect re-runs the version gate.
+	upgradeRequired bool
+	// probeEmptyStreak counts consecutive receive generations whose local
+	// account probe stayed empty (or reported account-invalid text) while
+	// accounts.json still listed a linked account. It gates the
+	// signal_account_unreadable reauth park: one boot-time race must not park
+	// a valid link, but a persistent listAccounts/accounts.json disagreement
+	// still surfaces needs_reauth. Reset by a successful probe or an unpair.
+	probeEmptyStreak int
+
+	pairCancel    context.CancelFunc
+	receiveCancel context.CancelFunc
+	receiveToken  uint64
+	groupNames    map[string]string
+	contactByACI  map[string]string
+	historySync   struct {
+		startedAt             int64
+		lastImportAt          int64
+		importedConversations int
+		importedMessages      int
+	}
+	lastReceiveRecoveryAt int64
+	lastTmpSweep          time.Time
+
+	// wg tracks background goroutines (link, receive loop, metadata refresh,
+	// sweeps, sync requests) so Close can wait for them to finish. Without
+	// the join, reuse of package state after Close — tests swapping the
+	// runSignalCLI stub, serve restarting a bridge — races with loops that
+	// are still draining.
+	wg sync.WaitGroup
+}
+
+// goTracked runs fn on a goroutine that Close waits for.
+func (b *Bridge) goTracked(fn func()) {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		fn()
+	}()
+}
+
+type signalReceiveRecoveryRecord struct {
+	TimestampMS int64  `json:"timestamp_ms"`
+	Account     string `json:"account,omitempty"`
+	Reason      string `json:"reason"`
+	Error       string `json:"error,omitempty"`
+	Raw         string `json:"raw"`
+}
+
+type signalReceivePayload struct {
+	Account  string               `json:"account"`
+	Envelope signalEnvelope       `json:"envelope"`
+	Result   *signalReceiveResult `json:"result,omitempty"`
+}
+
+type signalReceiveResult struct {
+	Account  string         `json:"account"`
+	Envelope signalEnvelope `json:"envelope"`
+}
+
+type signalEnvelope struct {
+	Source          string               `json:"source"`
+	SourceName      string               `json:"sourceName"`
+	SourceNumber    string               `json:"sourceNumber"`
+	SourceUUID      string               `json:"sourceUuid"`
+	SourceServiceID string               `json:"sourceServiceId"`
+	Timestamp       int64                `json:"timestamp"`
+	DataMessage     *signalDataMessage   `json:"dataMessage"`
+	EditMessage     *signalEditMessage   `json:"editMessage"`
+	SyncMessage     *signalSyncMessage   `json:"syncMessage"`
+	TypingMessage   *signalTypingMessage `json:"typingMessage"`
+}
+
+type signalSyncMessage struct {
+	SentMessage *signalSentMessage `json:"sentMessage"`
+}
+
+type signalDataMessage struct {
+	Timestamp          int64                `json:"timestamp"`
+	Message            string               `json:"message"`
+	GroupInfo          *signalGroupInfo     `json:"groupInfo"`
+	Attachments        []signalAttachment   `json:"attachments"`
+	Mentions           []signalMention      `json:"mentions"`
+	Reaction           *signalReaction      `json:"reaction"`
+	Quote              *signalQuotedMessage `json:"quote"`
+	IsExpirationUpdate bool                 `json:"isExpirationUpdate"`
+	ViewOnce           bool                 `json:"viewOnce"`
+	Payment            json.RawMessage      `json:"payment"`
+	Previews           []json.RawMessage    `json:"previews"`
+	Sticker            json.RawMessage      `json:"sticker"`
+	RemoteDelete       json.RawMessage      `json:"remoteDelete"`
+	Contacts           []json.RawMessage    `json:"contacts"`
+	PollCreate         json.RawMessage      `json:"pollCreate"`
+	PollVote           json.RawMessage      `json:"pollVote"`
+	PollTerminate      json.RawMessage      `json:"pollTerminate"`
+	StoryContext       json.RawMessage      `json:"storyContext"`
+	PinMessage         json.RawMessage      `json:"pinMessage"`
+	UnpinMessage       json.RawMessage      `json:"unpinMessage"`
+	AdminDelete        json.RawMessage      `json:"adminDelete"`
+}
+
+type signalSentMessage struct {
+	Timestamp            int64                `json:"timestamp"`
+	Message              string               `json:"message"`
+	Destination          string               `json:"destination"`
+	DestinationNumber    string               `json:"destinationNumber"`
+	DestinationE164      string               `json:"destinationE164"`
+	DestinationUUID      string               `json:"destinationUuid"`
+	DestinationServiceID string               `json:"destinationServiceId"`
+	EditMessage          *signalEditMessage   `json:"editMessage"`
+	GroupInfo            *signalGroupInfo     `json:"groupInfo"`
+	Attachments          []signalAttachment   `json:"attachments"`
+	Mentions             []signalMention      `json:"mentions"`
+	Reaction             *signalReaction      `json:"reaction"`
+	Quote                *signalQuotedMessage `json:"quote"`
+	IsExpirationUpdate   bool                 `json:"isExpirationUpdate"`
+	ViewOnce             bool                 `json:"viewOnce"`
+	Payment              json.RawMessage      `json:"payment"`
+	Previews             []json.RawMessage    `json:"previews"`
+	Sticker              json.RawMessage      `json:"sticker"`
+	RemoteDelete         json.RawMessage      `json:"remoteDelete"`
+	Contacts             []json.RawMessage    `json:"contacts"`
+	PollCreate           json.RawMessage      `json:"pollCreate"`
+	PollVote             json.RawMessage      `json:"pollVote"`
+	PollTerminate        json.RawMessage      `json:"pollTerminate"`
+	StoryContext         json.RawMessage      `json:"storyContext"`
+	PinMessage           json.RawMessage      `json:"pinMessage"`
+	UnpinMessage         json.RawMessage      `json:"unpinMessage"`
+	AdminDelete          json.RawMessage      `json:"adminDelete"`
+}
+
+type signalGroupInfo struct {
+	GroupID   string `json:"groupId"`
+	Title     string `json:"title"`
+	GroupName string `json:"groupName"`
+	Type      string `json:"type"`
+}
+
+type signalEditMessage struct {
+	TargetSentTimestamp int64              `json:"targetSentTimestamp"`
+	DataMessage         *signalDataMessage `json:"dataMessage"`
+}
+
+type signalAttachment struct {
+	ContentType string `json:"contentType"`
+	ID          string `json:"id"`
+	Filename    string `json:"filename"`
+	Caption     string `json:"caption"`
+}
+
+type signalMention struct {
+	Number          string `json:"number"`
+	RecipientNumber string `json:"recipientNumber"`
+	Recipient       string `json:"recipient"`
+}
+
+type signalReaction struct {
+	Emoji                 string `json:"emoji"`
+	TargetAuthor          string `json:"targetAuthor"`
+	TargetAuthorNumber    string `json:"targetAuthorNumber"`
+	TargetAuthorUUID      string `json:"targetAuthorUuid"`
+	TargetAuthorACI       string `json:"targetAuthorAci"`
+	TargetAuthorServiceID string `json:"targetAuthorServiceId"`
+	TargetSentTimestamp   int64  `json:"targetSentTimestamp"`
+	IsRemove              bool   `json:"isRemove"`
+	Target                struct {
+		Timestamp       int64  `json:"timestamp"`
+		Author          string `json:"author"`
+		AuthorNumber    string `json:"authorNumber"`
+		AuthorUUID      string `json:"authorUuid"`
+		AuthorACI       string `json:"authorAci"`
+		AuthorServiceID string `json:"authorServiceId"`
+	} `json:"target"`
+}
+
+type signalQuotedMessage struct {
+	Timestamp int64  `json:"timestamp"`
+	Author    string `json:"author"`
+	AuthorACI string `json:"authorAci"`
+	Text      string `json:"text"`
+}
+
+type signalTypingMessage struct {
+	Action    string           `json:"action"`
+	GroupInfo *signalGroupInfo `json:"groupInfo"`
+}
+
+// Envelope is the pure signal-cli receive envelope shared by the retained
+// legacy receiver and the v2 durable decoder. The alias deliberately keeps a
+// single JSON shape instead of maintaining a second field-by-field parser.
+type Envelope = signalEnvelope
+
+// DataMessage, SentMessage, Reaction, and Attachment expose the nested pure
+// envelope values needed by the v2 decoder without moving transport behavior
+// out of signallive.
+type DataMessage = signalDataMessage
+type SentMessage = signalSentMessage
+type Reaction = signalReaction
+type Attachment = signalAttachment
+
+// ObserveIngress installs the one pre-dispatch Signal receive observer. A
+// later registration supersedes an earlier one; the returned function only
+// removes the registration it created.
+func (b *Bridge) ObserveIngress(observer func(account string, line []byte, resolvedSource string, resolvedDestination string)) func() {
+	if b == nil {
+		return func() {}
+	}
+	b.mu.Lock()
+	b.ingressObserverID++
+	registrationID := b.ingressObserverID
+	b.ingressObserver = observer
+	b.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			if b.ingressObserverID == registrationID {
+				b.ingressObserver = nil
+			}
+			b.mu.Unlock()
+		})
+	}
+}
+
+func (b *Bridge) observeIngress(account string, line []byte, resolvedSource string, resolvedDestination string) {
+	if b == nil {
+		return
+	}
+	b.mu.RLock()
+	observer := b.ingressObserver
+	b.mu.RUnlock()
+	if observer == nil {
+		return
+	}
+	line = bytes.Clone(line)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Warn().
+				Interface("panic", recovered).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal ingress observer")
+		}
+	}()
+	observer(account, line, resolvedSource, resolvedDestination)
+}
+
+// ReportIngressError lets the lifecycle adapter log an isolated durable-tee
+// failure through the bridge's configured logger without coupling signallive
+// to the generic bridge package.
+func (b *Bridge) ReportIngressError(err error) {
+	if b == nil || err == nil {
+		return
+	}
+	b.logger.Warn().Err(err).Msg("Signal durable ingress tee failed; legacy receive continued")
+}
+
+func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Callbacks) (*Bridge, error) {
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return nil, fmt.Errorf("create Signal config dir: %w", err)
+	}
+	bridge := &Bridge{
+		store:        store,
+		logger:       logger,
+		configDir:    configDir,
+		callbacks:    callbacks,
+		groupNames:   map[string]string{},
+		contactByACI: map[string]string{},
+	}
+	bridge.account = bridge.firstStoredAccount()
+	bridge.lastTmpSweep = now()
+	go sweepSignalTmpRoot(logger, signalRunTmpMaxAge)
+	if bridge.account != "" {
+		// Only a paired install can have produced libsignal litter, so the
+		// legacy system-temp sweep stays scoped to installs that ran the
+		// bridge before per-run temp dirs existed.
+		go sweepLegacyLibsignalTemp(logger)
+	}
+	return bridge, nil
+}
+
+func signalCLIExecutable() string {
+	if override := strings.TrimSpace(os.Getenv("OPENMESSAGES_SIGNAL_CLI")); override != "" {
+		return override
+	}
+	if resolved, err := signalCLILookPath("signal-cli"); err == nil && strings.TrimSpace(resolved) != "" {
+		return resolved
+	}
+	for _, candidate := range []string{
+		"/opt/homebrew/bin/signal-cli",
+		"/usr/local/bin/signal-cli",
+		"/opt/local/bin/signal-cli",
+	} {
+		if _, err := signalCLIStat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "signal-cli"
+}
+
+func (b *Bridge) ConnectIfPaired() error {
+	b.mu.Lock()
+	if b.pairing || b.connecting || b.connected || b.upgradeRequired {
+		b.mu.Unlock()
+		return nil
+	}
+	if b.account == "" {
+		b.account = b.firstStoredAccount()
+	}
+	if b.account == "" {
+		b.mu.Unlock()
+		return nil
+	}
+	b.connecting = true
+	b.lastError = ""
+	account := b.account
+	b.mu.Unlock()
+	b.emitStatusChange()
+	b.goTracked(func() { b.startReceiveLoop(account, false) })
+	return nil
+}
+
+func (b *Bridge) Connect() error {
+	b.mu.Lock()
+	if b.account == "" {
+		b.account = b.firstStoredAccount()
+	}
+	if b.account != "" {
+		if b.pairing || b.connecting || b.connected {
+			b.mu.Unlock()
+			return nil
+		}
+		b.connecting = true
+		b.needsReauth = false
+		b.upgradeRequired = false
+		b.lastError = ""
+		account := b.account
+		b.mu.Unlock()
+		b.emitStatusChange()
+		b.goTracked(func() { b.startReceiveLoop(account, false) })
+		return nil
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	b.pairCancel = cancel
+	b.pairing = true
+	b.connecting = true
+	b.needsReauth = false
+	b.upgradeRequired = false
+	b.lastError = ""
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	b.goTracked(func() { b.runLink(ctx) })
+	return nil
+}
+
+// StartPoller starts one manual Signal lifecycle for bridge.Supervisor. It
+// preserves Connect's behavior: an existing account re-runs the version gate
+// and retained receive poller, while an unpaired account runs the existing QR
+// link flow and hands directly into that same poller after a successful scan.
+// The method returns after the tracked goroutine is admitted; signal-cli work
+// remains asynchronous.
+func (b *Bridge) StartPoller(ctx context.Context) (PollerRun, error) {
+	if ctx == nil {
+		return nil, errors.New("signal poller: nil start context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	if b.account == "" {
+		b.account = b.firstStoredAccount()
+	}
+	if b.pairing || b.connecting || b.connected {
+		b.mu.Unlock()
+		return nil, errors.New("signal poller lifecycle is already active")
+	}
+
+	run, runCtx := newPollerRun(ctx)
+	account := b.account
+	b.connecting = true
+	b.needsReauth = false
+	b.upgradeRequired = false
+	b.lastError = ""
+	if account == "" {
+		b.pairing = true
+		b.pairCancel = run.cancel
+		b.qr = QRSnapshot{}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	b.wg.Add(1)
+	go func() {
+		var exit PollerExit
+		if account == "" {
+			exit = b.runLinkPoller(runCtx, run)
+		} else {
+			exit = b.runReceiveLoop(runCtx, account, false, run)
+		}
+		// Done is the retained link/receive loop's terminal result. Metadata/WAL
+		// replay remains host-scoped, as before, and Bridge.Close joins it before
+		// App closes the store.
+		run.finish(exit)
+		b.wg.Done()
+		run.markStopped()
+	}()
+	return run, nil
+}
+
+func (b *Bridge) Unpair() error {
+	return b.UnpairContext(context.Background())
+}
+
+// UnpairContext bounds the join before signal-cli state is removed. The
+// context-free Unpair method remains for legacy callers.
+func (b *Bridge) UnpairContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("signal unpair: nil context")
+	}
+	b.cancelBackgroundWork(true)
+	// Wait for in-flight loops before removing the config dir: a draining
+	// receive poll may still be writing WAL/recovery files inside it, and
+	// RemoveAll on a directory that's being written to fails part-way.
+	joined := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := os.RemoveAll(b.configDir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove Signal config dir: %w", err)
+	}
+	b.mu.Lock()
+	b.connected = false
+	b.connecting = false
+	b.pairing = false
+	b.account = ""
+	b.needsReauth = false
+	b.upgradeRequired = false
+	b.probeEmptyStreak = 0
+	b.lastError = ""
+	b.qr = QRSnapshot{}
+	b.historySync = struct {
+		startedAt             int64
+		lastImportAt          int64
+		importedConversations int
+		importedMessages      int
+	}{}
+	b.lastReceiveRecoveryAt = 0
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return nil
+}
+
+func (b *Bridge) Status() StatusSnapshot {
+	b.mu.RLock()
+	account := b.account
+	if account == "" {
+		account = b.firstStoredAccount()
+	}
+	snapshot := StatusSnapshot{
+		Connected:       b.connected,
+		Connecting:      b.connecting,
+		Paired:          account != "",
+		Pairing:         b.pairing,
+		Account:         account,
+		LastError:       b.lastError,
+		QRAvailable:     b.qr.URI != "",
+		QRUpdatedAt:     b.qr.UpdatedAt,
+		UpgradeRequired: b.upgradeRequired,
+		NeedsReauth:     b.needsReauth,
+		HistorySync:     b.historySyncSnapshotLocked(),
+	}
+	b.mu.RUnlock()
+	snapshot.ReceiveRecovery = b.receiveRecoveryStatus()
+	return snapshot
+}
+
+// InputFingerprint captures the paired account and signal-cli executable
+// identity used by a blocked generation. It is intentionally cheap and does
+// not execute signal-cli; a manual reconnect can therefore notice an upgraded
+// binary without creating a second lifecycle owner.
+func (b *Bridge) InputFingerprint() string {
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "config=%s\n", b.configDir)
+	accountsPath := filepath.Join(b.configDir, "data", "accounts.json")
+	if data, err := os.ReadFile(accountsPath); err == nil {
+		_, _ = hash.Write(data)
+	} else {
+		_, _ = fmt.Fprintf(hash, "accounts_error=%v\n", err)
+	}
+	executable := signalCLIExecutable()
+	_, _ = fmt.Fprintf(hash, "executable=%s\n", executable)
+	if info, err := os.Stat(executable); err == nil {
+		_, _ = fmt.Fprintf(
+			hash,
+			"mode=%s\nsize=%d\nmtime=%d\n",
+			info.Mode(),
+			info.Size(),
+			info.ModTime().UnixNano(),
+		)
+	} else {
+		_, _ = fmt.Fprintf(hash, "executable_error=%v\n", err)
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+// ApplyPollerFailure keeps the legacy Signal status projection aligned when a
+// send path, rather than the receive loop, terminates the active generation.
+// Cancellation/join remains the adapter's responsibility.
+func (b *Bridge) ApplyPollerFailure(exit PollerExit) {
+	if exit.Err == nil {
+		return
+	}
+	b.mu.Lock()
+	// Once the receive loop has established a terminal condition, a racing
+	// ordinary send failure cannot downgrade it and accidentally resume churn.
+	if b.upgradeRequired && exit.Kind != PollerFailureUpgrade {
+		b.mu.Unlock()
+		return
+	}
+	if b.needsReauth && exit.Kind == PollerFailureTransient {
+		b.mu.Unlock()
+		return
+	}
+	b.connected = false
+	b.connecting = false
+	b.lastError = exit.Err.Error()
+	switch exit.Kind {
+	case PollerFailureReauth:
+		b.needsReauth = true
+		b.upgradeRequired = false
+	case PollerFailureUpgrade:
+		b.needsReauth = false
+		b.upgradeRequired = true
+	case PollerFailureTransient:
+		b.needsReauth = false
+		b.upgradeRequired = false
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+}
+
+func (b *Bridge) ReplayReceiveRecoveryQueue() error {
+	account, err := b.usableAccount()
+	if err != nil {
+		return err
+	}
+	b.replayReceiveRecoveryQueue(account)
+	return nil
+}
+
+func (b *Bridge) QRCode() (QRSnapshot, error) {
+	b.mu.RLock()
+	snap := b.qr
+	b.mu.RUnlock()
+	if snap.URI == "" {
+		return snap, fmt.Errorf("no active Signal QR code")
+	}
+	code, err := qr.Encode(snap.URI, qr.M)
+	if err != nil {
+		return QRSnapshot{}, fmt.Errorf("encode Signal QR: %w", err)
+	}
+	snap.PNGDataURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(code.PNG())
+	return snap, nil
+}
+
+func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil, errors.New("signal message body is required")
+	}
+
+	account, err := b.usableAccount()
+	if err != nil {
+		return nil, err
+	}
+	target, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return nil, err
+	}
+
+	args := []string{"-a", account, "send", "-m", body}
+	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, quoteArgs...)
+	if isGroup {
+		args = append(args, "--group-id", target)
+	} else {
+		args = append(args, target)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	if err != nil {
+		return nil, commandError("send Signal message", err, output)
+	}
+
+	timestamp := now().UnixMilli()
+	messageID := localOutgoingMessageID(conversationID, timestamp, body)
+	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	msg := &db.Message{
+		MessageID:      messageID,
+		ConversationID: conversationID,
+		SenderName:     senderName,
+		SenderNumber:   account,
+		Body:           body,
+		TimestampMS:    timestamp,
+		Status:         "sent",
+		IsFromMe:       true,
+		ReplyToID:      strings.TrimSpace(replyToID),
+		SourcePlatform: "signal",
+		SourceID:       strings.TrimPrefix(messageID, "signal:"),
+	}
+	return msg, nil
+}
+
+// SendTextRequest sends one text message through signal-cli's structured JSON
+// path and returns Signal's canonical outgoing identity. Signal uses the send
+// timestamp as its message ID; the durable request ID remains local dedupe
+// metadata until reconciliation can make uncertain retries safe.
+func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timestampMS int64, err error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return 0, errors.New("signal message body is required")
+	}
+
+	account, err := b.usableAccount()
+	if err != nil {
+		return 0, err
+	}
+	target, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return 0, err
+	}
+
+	args := []string{"--output=json", "-a", account, "send", "-m", body}
+	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	if err != nil {
+		return 0, err
+	}
+	args = append(args, quoteArgs...)
+	if isGroup {
+		args = append(args, "--group-id", target)
+	} else {
+		args = append(args, target)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	timestampMS, resultErr := parseSignalSendResult(output)
+	if commandErr != nil {
+		timedOut := errors.Is(commandErr, context.Canceled) ||
+			errors.Is(commandErr, context.DeadlineExceeded) ||
+			ctx.Err() != nil
+		if !timedOut && signalSendAllRecipientsFailed(resultErr) {
+			return 0, commandNotDispatchedError(
+				"send Signal message",
+				errors.Join(commandErr, resultErr),
+				output,
+			)
+		}
+		return 0, commandError("send Signal message", commandErr, output)
+	}
+	if resultErr != nil {
+		if signalSendAllRecipientsFailed(resultErr) {
+			return 0, commandNotDispatchedError("send Signal message", resultErr, output)
+		}
+		var partial *signalSendRecipientResultsError
+		if !errors.As(resultErr, &partial) || timestampMS <= 0 {
+			return 0, commandError("parse Signal text send result", resultErr, output)
+		}
+		// Mixed per-recipient results with >=1 SUCCESS: signal-cli exits 0
+		// because the message went out. Per-recipient delivery gaps are M5
+		// reconciliation's job.
+	}
+	return timestampMS, nil
+}
+
+func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
+	if len(data) == 0 {
+		return nil, errors.New("signal attachment is required")
+	}
+	result, err := b.sendMediaRequest(
+		conversationID,
+		bytes.NewReader(data),
+		int64(len(data)),
+		filename,
+		caption,
+		replyToID,
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	caption = strings.TrimSpace(caption)
+	body := caption
+	if body == "" {
+		body = signalAttachmentPlaceholder([]signalAttachment{{ContentType: mime}})
+	}
+	remoteID := strconv.FormatInt(result.timestampMS, 10)
+	messageID := "signal:" + remoteID
+	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	msg := &db.Message{
+		MessageID:      messageID,
+		ConversationID: conversationID,
+		SenderName:     senderName,
+		SenderNumber:   result.account,
+		Body:           body,
+		TimestampMS:    result.timestampMS,
+		Status:         "sent",
+		IsFromMe:       true,
+		ReplyToID:      strings.TrimSpace(replyToID),
+		SourcePlatform: "signal",
+		SourceID:       remoteID,
+		MimeType:       strings.TrimSpace(mime),
+		MediaID:        encodeSignalLocalAttachmentRef(result.attachmentPath),
+	}
+	return msg, nil
+}
+
+// SendMediaRequest streams one attachment to signal-cli and returns Signal's
+// canonical outgoing identity. Signal uses the send timestamp as its message
+// ID; the durable request ID remains local dedupe metadata until reconciliation
+// can make uncertain retries safe.
+func (b *Bridge) SendMediaRequest(
+	conversationID string,
+	content io.Reader,
+	size int64,
+	filename, mime, caption, replyToID string,
+) (timestampMS int64, err error) {
+	result, err := b.sendMediaRequest(
+		conversationID,
+		content,
+		size,
+		filename,
+		caption,
+		replyToID,
+		false,
+	)
+	return result.timestampMS, err
+}
+
+type signalMediaRequestResult struct {
+	account        string
+	timestampMS    int64
+	attachmentPath string
+}
+
+// sendMediaRequest is shared by the durable adapter path and the retained web
+// path. The former removes its transport temp file on every outcome; the latter
+// retains the successful file because its db.Message MediaID still serves that
+// exact local attachment through the legacy download endpoint.
+func (b *Bridge) sendMediaRequest(
+	conversationID string,
+	content io.Reader,
+	size int64,
+	filename, caption, replyToID string,
+	retainOnSuccess bool,
+) (result signalMediaRequestResult, err error) {
+	account, err := b.usableAccount()
+	if err != nil {
+		return result, err
+	}
+	target, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return result, err
+	}
+
+	attachmentPath, err := b.writeLocalAttachmentReader(content, size, filename)
+	if err != nil {
+		return result, err
+	}
+	removeAttachment := true
+	defer func() {
+		if removeAttachment {
+			_ = os.Remove(attachmentPath)
+		}
+	}()
+
+	caption = strings.TrimSpace(caption)
+	args := []string{"--output=json", "-a", account, "send"}
+	if caption != "" {
+		args = append(args, "-m", caption)
+	}
+	// Use `--attachment=path` (not `-a path`). signal-cli's send subcommand
+	// defines -a/--attachment with nargs='*', which makes argparse greedily
+	// consume every following token as another attachment — including the
+	// positional recipient. Anchoring the value with `=` prevents that and
+	// keeps the recipient available for parsing as the positional.
+	// Reproduced with "No recipients given" when sending to an ACI-only contact.
+	args = append(args, "--attachment="+attachmentPath)
+	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	if err != nil {
+		return result, err
+	}
+	args = append(args, quoteArgs...)
+	if isGroup {
+		args = append(args, "--group-id", target)
+	} else {
+		args = append(args, target)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	timestampMS, resultErr := parseSignalSendResult(output)
+	if commandErr != nil {
+		timedOut := errors.Is(commandErr, context.Canceled) ||
+			errors.Is(commandErr, context.DeadlineExceeded) ||
+			ctx.Err() != nil
+		if !timedOut && signalSendAllRecipientsFailed(resultErr) {
+			return result, commandNotDispatchedError(
+				"send Signal media",
+				errors.Join(commandErr, resultErr),
+				output,
+			)
+		}
+		return result, commandError("send Signal media", commandErr, output)
+	}
+	if resultErr != nil {
+		if signalSendAllRecipientsFailed(resultErr) {
+			return result, commandNotDispatchedError("send Signal media", resultErr, output)
+		}
+		var partial *signalSendRecipientResultsError
+		if !errors.As(resultErr, &partial) || timestampMS <= 0 {
+			return result, commandError("parse Signal media send result", resultErr, output)
+		}
+		// Mixed per-recipient results with >=1 SUCCESS: signal-cli itself exits 0
+		// here (it only throws when no recipient succeeded), so the pre-M2b legacy
+		// path treated this as a successful send. The message went out with a real
+		// timestamp; per-recipient delivery gaps are M5 reconciliation's job.
+	}
+	result = signalMediaRequestResult{
+		account:        account,
+		timestampMS:    timestampMS,
+		attachmentPath: attachmentPath,
+	}
+	removeAttachment = !retainOnSuccess
+	return result, nil
+}
+
+type signalSendResult struct {
+	Timestamp int64 `json:"timestamp"`
+	Results   []struct {
+		RecipientAddress json.RawMessage `json:"recipientAddress"`
+		Type             string          `json:"type"`
+	} `json:"results"`
+}
+
+// parseSignalSendResult decodes signal-cli's --output=json send result
+// from CombinedOutput. The buffer can carry stderr noise (signal-cli WARN
+// lines, JVM notes) around the JSON object on a fully successful send, so a
+// whole-buffer decode falls back to a per-line scan for the object carrying a
+// timestamp — the same noise-tolerant convention parseSignalAccounts uses.
+// On mixed per-recipient results the timestamp is returned ALONGSIDE the
+// recipient-results error so callers can honor signal-cli's own exit-0
+// semantics (>=1 success means the message went out).
+func parseSignalSendResult(output []byte) (int64, error) {
+	result, decodeErr := decodeSignalSendJSON(output)
+	if decodeErr != nil {
+		return 0, decodeErr
+	}
+	if result.Timestamp <= 0 {
+		return 0, errors.New("Signal media send result has no valid timestamp")
+	}
+	if len(result.Results) == 0 {
+		return 0, errors.New("Signal media send result has no recipient results")
+	}
+
+	successCount := 0
+	failures := make([]string, 0, len(result.Results))
+	for index, recipient := range result.Results {
+		address := bytes.TrimSpace(recipient.RecipientAddress)
+		if len(address) == 0 || bytes.Equal(address, []byte("null")) {
+			return 0, fmt.Errorf("Signal media recipient result %d has no address", index)
+		}
+		resultType := strings.TrimSpace(recipient.Type)
+		switch resultType {
+		case "SUCCESS":
+			successCount++
+		case "NETWORK_FAILURE", "RATE_LIMIT_FAILURE", "UNREGISTERED_FAILURE",
+			"IDENTITY_FAILURE", "INVALID_PRE_KEY_FAILURE":
+			failures = append(failures, fmt.Sprintf("recipient %d: %s", index, resultType))
+		default:
+			if resultType == "" {
+				resultType = "missing result type"
+			}
+			return 0, fmt.Errorf("Signal media recipient result %d has unknown type %s", index, resultType)
+		}
+	}
+	if len(failures) > 0 {
+		return result.Timestamp, &signalSendRecipientResultsError{
+			failures:            failures,
+			allRecipientsFailed: successCount == 0,
+		}
+	}
+	return result.Timestamp, nil
+}
+
+func decodeSignalSendJSON(output []byte) (signalSendResult, error) {
+	var result signalSendResult
+	wholeErr := json.Unmarshal(output, &result)
+	if wholeErr == nil {
+		return result, nil
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var candidate signalSendResult
+		if err := json.Unmarshal([]byte(line), &candidate); err != nil {
+			continue
+		}
+		if candidate.Timestamp > 0 {
+			return candidate, nil
+		}
+	}
+	return result, fmt.Errorf("decode Signal media send JSON: %w", wholeErr)
+}
+
+type signalSendRecipientResultsError struct {
+	failures            []string
+	allRecipientsFailed bool
+}
+
+func (e *signalSendRecipientResultsError) Error() string {
+	return "Signal media send failed for " + strings.Join(e.failures, ", ")
+}
+
+func signalSendAllRecipientsFailed(err error) bool {
+	var resultErr *signalSendRecipientResultsError
+	return errors.As(err, &resultErr) && resultErr.allRecipientsFailed
+}
+
+// SendReactionRequest sends a reaction using only the durable request's remote
+// references. Unlike the legacy SendReaction path, it neither reads nor updates
+// locally stored message state.
+func (b *Bridge) SendReactionRequest(
+	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+) error {
+	targetRemoteID = strings.TrimSpace(targetRemoteID)
+	if targetRemoteID == "" {
+		return errors.New("signal target message is required")
+	}
+	emoji = strings.TrimSpace(emoji)
+	if emoji == "" {
+		return errors.New("signal reaction emoji is required")
+	}
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == "" {
+		action = "add"
+	}
+
+	account, err := b.usableAccount()
+	if err != nil {
+		return err
+	}
+	recipient, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return err
+	}
+	targetAuthor := strings.TrimSpace(targetAuthorID)
+	if targetAuthor == "" {
+		// An empty author identifies a message sent by this account.
+		targetAuthor = account
+	}
+
+	args := []string{
+		"-a", account,
+		"sendReaction",
+		"-e", emoji,
+		"-a", targetAuthor,
+		"-t", targetRemoteID,
+	}
+	if action == "remove" {
+		args = append(args, "-r")
+	}
+	// Signal has no native switch action: sending the new emoji without -r
+	// overwrites the account's existing reaction.
+	if isGroup {
+		args = append(args, "--group-id", recipient)
+	} else {
+		args = append(args, recipient)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	if err != nil {
+		// There is no structured reaction result that can prove a signal-cli
+		// boundary failure was not dispatched, so it remains uncertain.
+		return commandError("send Signal reaction", err, output)
+	}
+	return nil
+}
+
+func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
+	targetMessageID = strings.TrimSpace(targetMessageID)
+	if targetMessageID == "" {
+		return errors.New("signal target message is required")
+	}
+	emoji = strings.TrimSpace(emoji)
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == "" {
+		action = "add"
+	}
+	if emoji == "" {
+		return errors.New("signal reaction emoji is required")
+	}
+
+	target, err := b.store.GetMessageByID(targetMessageID)
+	if err != nil {
+		return fmt.Errorf("load Signal reaction target: %w", err)
+	}
+	if target == nil || target.SourcePlatform != "signal" {
+		return errors.New("signal reaction target not found")
+	}
+	if strings.TrimSpace(conversationID) == "" {
+		conversationID = target.ConversationID
+	}
+
+	account, err := b.usableAccount()
+	if err != nil {
+		return err
+	}
+	targetConversationID := strings.TrimSpace(target.ConversationID)
+	if targetConversationID == "" {
+		targetConversationID = strings.TrimSpace(conversationID)
+	}
+	recipient, isGroup, err := parseConversationTarget(targetConversationID)
+	if err != nil {
+		return err
+	}
+	targetAuthor := b.resolveContactAddress(target.SenderNumber)
+	if targetAuthor == "" {
+		return errors.New("signal reaction target author is unavailable")
+	}
+
+	args := []string{"-a", account, "sendReaction", "-e", emoji, "-a", targetAuthor, "-t", strconv.FormatInt(target.TimestampMS, 10)}
+	if action == "remove" {
+		args = append(args, "-r")
+	}
+	if isGroup {
+		args = append(args, "--group-id", recipient)
+	} else {
+		args = append(args, recipient)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	if err != nil {
+		return commandError("send Signal reaction", err, output)
+	}
+
+	nextReactions, changed, err := updateStoredReactions(target.Reactions, account, signalReactionStoreEmoji(emoji, action))
+	if err != nil {
+		return fmt.Errorf("update local Signal reaction state: %w", err)
+	}
+	if !changed {
+		return nil
+	}
+	target.Reactions = nextReactions
+	if err := b.store.UpdateMessageReactions(target.MessageID, nextReactions); err != nil {
+		return fmt.Errorf("store Signal reaction update: %w", err)
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(target.ConversationID)
+	}
+	return nil
+}
+
+func (b *Bridge) Close() error {
+	b.cancelBackgroundWork(false)
+	b.wg.Wait()
+	return nil
+}
+
+func (b *Bridge) runLink(ctx context.Context) {
+	_ = b.runLinkPoller(ctx, nil)
+}
+
+func (b *Bridge) runLinkPoller(ctx context.Context, run *pollerRun) PollerExit {
+	reader, wait, err := startSignalLink(ctx, b.configDir)
+	if err != nil {
+		b.mu.Lock()
+		b.pairing = false
+		b.connecting = false
+		b.lastError = err.Error()
+		b.pairCancel = nil
+		b.mu.Unlock()
+		b.emitStatusChange()
+		return PollerExit{
+			Kind:        PollerFailureUnpaired,
+			Operation:   "pair",
+			Fingerprint: SignalPairingIncompleteFingerprint,
+			Err:         err,
+		}
+	}
+	defer reader.Close()
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lastLine := ""
+	for scanner.Scan() {
+		line := sanitizeSignalOutput(scanner.Text())
+		if uri := extractSignalLinkURI(line); uri != "" {
+			b.mu.Lock()
+			b.qr = QRSnapshot{
+				URI:       uri,
+				UpdatedAt: now().UnixMilli(),
+			}
+			b.mu.Unlock()
+			b.emitStatusChange()
+			if run != nil {
+				run.beat("pairing_qr")
+			}
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			lastLine = strings.TrimSpace(line)
+		}
+	}
+	waitErr := wait()
+	if scanErr := scanner.Err(); scanErr != nil && waitErr == nil {
+		waitErr = scanErr
+	}
+
+	var account string
+	var accountErr error
+	if ctx.Err() == nil {
+		probeCtx, cancel := context.WithTimeout(ctx, postLinkProbeTimeout)
+		account, accountErr = b.probeAccount(probeCtx, "")
+		cancel()
+	}
+	b.mu.Lock()
+	b.pairing = false
+	b.connecting = false
+	b.pairCancel = nil
+	b.qr = QRSnapshot{}
+	if account != "" {
+		b.account = account
+		b.lastError = ""
+	} else {
+		switch {
+		case accountErr != nil:
+			b.lastError = accountErr.Error()
+		case lastLine != "":
+			b.lastError = lastLine
+		case waitErr != nil:
+			b.lastError = waitErr.Error()
+		default:
+			b.lastError = "Signal pairing cancelled"
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	if account != "" {
+		return b.runReceiveLoop(ctx, account, true, run)
+	}
+	if ctx.Err() != nil {
+		return PollerExit{Err: ctx.Err()}
+	}
+	detail := strings.TrimSpace(b.Status().LastError)
+	if detail == "" {
+		detail = "Signal pairing did not produce a linked account"
+	}
+	return PollerExit{
+		Kind:        PollerFailureUnpaired,
+		Operation:   "pair",
+		Fingerprint: SignalPairingIncompleteFingerprint,
+		Err:         errors.New(detail),
+	}
+}
+
+func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
+	_ = b.runReceiveLoop(context.Background(), account, requestSync, nil)
+}
+
+func (b *Bridge) runReceiveLoop(
+	parent context.Context,
+	account string,
+	requestSync bool,
+	run *pollerRun,
+) (exit PollerExit) {
+	// A panic while parsing an attacker-influenced envelope (unchecked indexes
+	// into attachments/reactions/quotes) would otherwise kill this goroutine
+	// and leave connected=true — Signal silently freezes. Recover and report a
+	// typed transient exit so the supervisor owns the eventual retry.
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	b.mu.Lock()
+	if b.receiveCancel != nil {
+		b.receiveCancel()
+	}
+	b.receiveToken++
+	token := b.receiveToken
+	b.receiveCancel = cancel
+	b.mu.Unlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal receive loop")
+			b.mu.Lock()
+			b.connected = false
+			b.connecting = false
+			b.lastError = fmt.Sprintf("panic in Signal receive loop: %v", r)
+			b.mu.Unlock()
+			b.emitStatusChange()
+			exit = PollerExit{
+				Kind:        PollerFailureTransient,
+				Operation:   "receive",
+				Fingerprint: SignalReceivePanicFingerprint,
+				Err:         fmt.Errorf("panic in Signal receive loop: %v", r),
+			}
+		}
+		b.mu.Lock()
+		if b.receiveToken == token {
+			b.receiveCancel = nil
+		}
+		b.mu.Unlock()
+	}()
+
+	versionCtx, versionCancel := context.WithTimeout(ctx, versionProbeTimeout)
+	versionOutput, versionErr := probeSignalCLIVersion(versionCtx)
+	versionCancel()
+	if ctx.Err() != nil {
+		b.mu.Lock()
+		if b.receiveToken == token {
+			b.receiveCancel = nil
+			b.connected = false
+			b.connecting = false
+		}
+		b.mu.Unlock()
+		return PollerExit{Err: ctx.Err()}
+	}
+	version, versionDetected := parseSignalCLIVersion(versionOutput)
+	if versionDetected && version.less(minimumSignalCLIVersion) {
+		detail := fmt.Sprintf(
+			"signal-cli %s is below the required minimum %s; upgrade signal-cli to continue receiving messages",
+			version, minimumSignalCLIVersion,
+		)
+		b.parkUpgradeRequired(token, detail)
+		return PollerExit{
+			Kind:        PollerFailureUpgrade,
+			Operation:   "version_gate",
+			Fingerprint: SignalCLIVersionFingerprint,
+			Err:         errors.New(detail),
+		}
+	}
+	if !versionDetected {
+		event := b.logger.Warn()
+		if versionErr != nil {
+			event = event.Err(versionErr)
+		}
+		if output := strings.TrimSpace(string(versionOutput)); output != "" {
+			event = event.Str("output", output)
+		}
+		event.Msg("Unable to detect signal-cli version; continuing receive without version gate")
+	}
+
+	probedAccount, probeErr := b.probeAccountWithRetry(ctx, account, run)
+	if ctx.Err() != nil {
+		b.mu.Lock()
+		if b.receiveToken == token {
+			b.receiveCancel = nil
+			b.connected = false
+			b.connecting = false
+		}
+		b.mu.Unlock()
+		return PollerExit{Err: ctx.Err()}
+	}
+	if probeErr != nil || probedAccount == "" {
+		return b.classifyFailedAccountProbe(token, probeErr)
+	}
+
+	b.mu.Lock()
+	b.account = probedAccount
+	b.connected = true
+	b.connecting = false
+	b.needsReauth = false // successful connect clears any prior re-auth flag
+	b.upgradeRequired = false
+	b.probeEmptyStreak = 0
+	b.lastError = ""
+	b.mu.Unlock()
+	b.emitStatusChange()
+	if run != nil {
+		run.beat("account_probe")
+		run.markReady()
+	}
+	b.goTracked(func() { b.refreshMetadataAndReplay(probedAccount) })
+	if requestSync {
+		b.beginHistorySync()
+		b.emitStatusChange()
+		if err := b.requestSync(probedAccount); err != nil {
+			b.logger.Debug().Err(err).Msg("Failed to request Signal device sync after pairing")
+		}
+	}
+
+	consecutiveFailures := 0
+	consecutivePoisonFailures := 0
+	consecutiveAccountInvalid := 0
+	lastPoisonFingerprint := ""
+	for {
+		select {
+		case <-ctx.Done():
+			b.mu.Lock()
+			if b.receiveToken == token {
+				b.receiveCancel = nil
+			}
+			if !b.pairing {
+				b.connected = false
+			}
+			b.mu.Unlock()
+			b.emitStatusChange()
+			return PollerExit{Err: ctx.Err()}
+		default:
+		}
+
+		b.maybeSweepTmp()
+
+		callCtx, callCancel := context.WithTimeout(ctx, time.Duration(receiveTimeoutSeconds+3)*time.Second)
+		b.commandMu.Lock()
+		output, err := runSignalCLI(callCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
+		b.commandMu.Unlock()
+		timedOut := errors.Is(callCtx.Err(), context.DeadlineExceeded)
+		callCancel()
+		if ctx.Err() != nil {
+			continue
+		}
+		if err != nil {
+			if isSignalIdleReceiveTimeout(err, timedOut, output) {
+				consecutiveFailures = 0
+				consecutivePoisonFailures = 0
+				consecutiveAccountInvalid = 0
+				lastPoisonFingerprint = ""
+				if run != nil {
+					run.beat("receive_idle")
+				}
+				continue
+			}
+			if isSignalAccountInvalid(err, output) {
+				// Signal-side says the account is no longer registered /
+				// authorized. That is server-backed evidence, but one glitched
+				// invocation must not latch a permanent park: require
+				// receiveAccountInvalidLimit consecutive confirmations. A
+				// genuinely unlinked account fails every attempt the same way
+				// and still parks within seconds.
+				consecutiveAccountInvalid++
+				if consecutiveAccountInvalid < receiveAccountInvalidLimit {
+					consecutiveFailures++
+					consecutivePoisonFailures = 0
+					lastPoisonFingerprint = ""
+					b.logger.Warn().
+						Err(commandError("receive Signal messages", err, output)).
+						Int("confirmations", consecutiveAccountInvalid).
+						Int("required", receiveAccountInvalidLimit).
+						Msg("Signal receive reported an invalid account; retrying once before parking reauth")
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				// Don't clear b.account — we want the UI to
+				// know *which* account needs re-pairing. Instead flip
+				// needsReauth so the supervisor parks and the UI surfaces a
+				// clear "re-pair Signal" banner.
+				b.mu.Lock()
+				if b.receiveToken == token {
+					b.receiveCancel = nil
+				}
+				b.connected = false
+				b.connecting = false
+				b.needsReauth = true
+				b.lastError = cleanSignalCommandOutput(err, output)
+				b.logger.Warn().Str("account", b.account).Msg("Signal account needs re-pairing (signal-cli reports unregistered/unauthorized)")
+				b.mu.Unlock()
+				b.emitStatusChange()
+				return PollerExit{
+					Kind:        PollerFailureReauth,
+					Operation:   "receive",
+					Fingerprint: SignalAccountInvalidFingerprint,
+					Err:         commandError("receive Signal messages", err, output),
+				}
+			}
+			consecutiveAccountInvalid = 0
+			poisonFingerprint := signalReceivePoisonFingerprint(err, output)
+			if poisonFingerprint == "" {
+				consecutivePoisonFailures = 0
+				lastPoisonFingerprint = ""
+			} else if poisonFingerprint == lastPoisonFingerprint {
+				consecutivePoisonFailures++
+			} else {
+				lastPoisonFingerprint = poisonFingerprint
+				consecutivePoisonFailures = 1
+			}
+			consecutiveFailures++
+			receiveErr := commandError("receive Signal messages", err, output)
+			if consecutivePoisonFailures >= receivePoisonLimit {
+				detail := fmt.Sprintf(
+					"signal-cli repeatedly failed in IncomingMessageHandler.getSender() because content is null; upgrade signal-cli to %s or newer",
+					minimumSignalCLIVersion,
+				)
+				b.parkUpgradeRequired(token, detail)
+				return PollerExit{
+					Kind:        PollerFailureUpgrade,
+					Operation:   "receive",
+					Fingerprint: signalGetSenderPoisonFingerprint,
+					Err:         errors.New(detail),
+				}
+			}
+			if consecutiveFailures >= receiveFailureLimit {
+				b.logger.Warn().Err(receiveErr).Int("failures", consecutiveFailures).Msg("Signal receive polling repeatedly failed; forcing reconnect")
+				b.mu.Lock()
+				if b.receiveToken == token {
+					b.receiveCancel = nil
+				}
+				b.connected = false
+				b.connecting = false
+				b.lastError = cleanSignalCommandOutput(err, output)
+				b.mu.Unlock()
+				b.emitStatusChange()
+				return PollerExit{
+					Kind:        PollerFailureTransient,
+					Operation:   "receive",
+					Fingerprint: SignalReceiveFailureFingerprint,
+					Err:         receiveErr,
+				}
+			}
+			b.logger.Debug().Err(receiveErr).Int("failures", consecutiveFailures).Msg("Signal receive polling failed")
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		consecutiveFailures = 0
+		consecutivePoisonFailures = 0
+		consecutiveAccountInvalid = 0
+		lastPoisonFingerprint = ""
+		if run != nil {
+			detail := "receive_poll"
+			if len(bytes.TrimSpace(output)) != 0 {
+				detail = "receive_batch"
+			}
+			run.beat(detail)
+		}
+		if len(bytes.TrimSpace(output)) == 0 {
+			continue
+		}
+		if err := b.handleReceiveOutput(probedAccount, output); err != nil {
+			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
+		}
+	}
+}
+
+// probeAccountWithRetry runs the listAccounts probe up to
+// len(accountProbeRetryDelays)+1 times before letting the caller classify the
+// failure. listAccounts is not a pure local read: signal-cli loads every
+// account listed in accounts.json and runs its own account check
+// (AccountHelper.checkAccountState), which performs a server round-trip while
+// the stored account is still marked registered. Any failure of that load —
+// transient network trouble at login-time autostart just as much as a real
+// server rejection — makes signal-cli print a "Ignoring <number>: …" /
+// "Failed to load <number>: …" warning and report zero accounts with exit 0
+// (verified live 2026-08-23 with --verbose). One such empty probe parked the
+// bridge in needs_reauth for 12-22h on 2026-07-24 and 2026-08-06 while a
+// manual reconnect succeeded in seconds. Retrying inside the generation keeps
+// a transient check failure from ever reaching the terminal classifier.
+// Returns ctx.Err() as the error when the generation is cancelled mid-retry.
+func (b *Bridge) probeAccountWithRetry(
+	ctx context.Context,
+	account string,
+	run *pollerRun,
+) (string, error) {
+	var probedAccount string
+	var probeErr error
+	for attempt := 0; ; attempt++ {
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, accountProbeAttemptTimeout)
+		probedAccount, probeErr = b.probeAccount(attemptCtx, account)
+		cancelAttempt()
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if probeErr == nil && probedAccount != "" {
+			return probedAccount, nil
+		}
+		if attempt >= len(accountProbeRetryDelays) {
+			return probedAccount, probeErr
+		}
+		event := b.logger.Warn().Int("attempt", attempt+1)
+		if probeErr != nil {
+			event = event.Err(probeErr)
+		}
+		event.Msg("Signal account probe came up empty; retrying before classifying")
+		if run != nil {
+			run.beat("account_probe_retry")
+		}
+		timer := time.NewTimer(accountProbeRetryDelays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// classifyFailedAccountProbe turns an exhausted account probe into the
+// generation's terminal exit. An empty listAccounts is ambiguous evidence:
+// signal-cli reports zero accounts (exit 0) for a transient failure of its
+// per-account load check exactly as it does for a server-confirmed
+// deregistration (a 403 there persists "registered": false into the account
+// file, after which every later load throws NotRegisteredException before any
+// network call — both observed live 2026-08-23). The probe output alone
+// cannot distinguish "couldn't check the account this instant" from "the
+// server unlinked this device", so parking reauth needs corroboration:
+//
+//   - accounts.json no longer lists any account: the link is locally gone, so
+//     the pre-existing immediate reauth park stands.
+//   - accounts.json still lists an account: count one strike and exit
+//     transient so supervisor backoff retries a fresh generation. Only
+//     accountUnreadableStreakLimit consecutive generations of the same
+//     disagreement park reauth, under SignalAccountUnreadableFingerprint so
+//     the cmd-layer park retest may re-probe it periodically.
+//
+// A probe error without account-invalid text stays a plain transient exit,
+// exactly as before. Nothing here ever unpairs: unpair deletes signal-cli
+// state (including CDN-expired media) and remains a manual-only action.
+func (b *Bridge) classifyFailedAccountProbe(token uint64, probeErr error) PollerExit {
+	locallyInvalid := probeErr == nil || isSignalAccountInvalid(probeErr, nil)
+	storedAccount := ""
+	if locallyInvalid {
+		storedAccount = b.firstStoredAccount()
+	}
+
+	b.mu.Lock()
+	b.connected = false
+	b.connecting = false
+	b.upgradeRequired = false
+	exit := PollerExit{Operation: "probe_account"}
+	switch {
+	case !locallyInvalid:
+		b.needsReauth = false
+		b.lastError = probeErr.Error()
+		exit.Kind = PollerFailureTransient
+		exit.Fingerprint = SignalAccountProbeFingerprint
+		exit.Err = probeErr
+	case storedAccount == "":
+		b.needsReauth = true
+		if probeErr != nil {
+			b.lastError = probeErr.Error()
+		} else {
+			b.lastError = "Signal account is not paired"
+		}
+		exit.Kind = PollerFailureReauth
+		exit.Fingerprint = SignalAccountInvalidFingerprint
+		exit.Err = errors.New(b.lastError)
+	default:
+		b.probeEmptyStreak++
+		if b.probeEmptyStreak >= accountUnreadableStreakLimit {
+			b.needsReauth = true
+			b.lastError = fmt.Sprintf(
+				"signal-cli cannot read the linked Signal account %s after %d consecutive attempts; the paced park retest will keep re-probing it",
+				storedAccount, b.probeEmptyStreak,
+			)
+			exit.Kind = PollerFailureReauth
+			exit.Fingerprint = SignalAccountUnreadableFingerprint
+			exit.Err = errors.New(b.lastError)
+		} else {
+			b.needsReauth = false
+			if probeErr != nil {
+				b.lastError = probeErr.Error()
+			} else {
+				b.lastError = "signal-cli reported no linked Signal account; retrying"
+			}
+			exit.Kind = PollerFailureTransient
+			exit.Fingerprint = SignalAccountProbeEmptyFingerprint
+			exit.Err = errors.New(b.lastError)
+		}
+	}
+	if b.receiveToken == token {
+		b.receiveCancel = nil
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return exit
+}
+
+func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
+	detail = strings.TrimSpace(detail)
+	b.mu.Lock()
+	if b.receiveToken != token {
+		b.mu.Unlock()
+		return
+	}
+	b.receiveCancel = nil
+	b.connected = false
+	b.connecting = false
+	b.needsReauth = false
+	b.upgradeRequired = true
+	b.lastError = detail
+	account := b.account
+	b.mu.Unlock()
+	b.logger.Warn().Str("account", account).Msg(detail)
+	b.emitStatusChange()
+}
+
+// maybeSweepTmp runs the crash-backstop sweeps at most once per
+// signalTmpSweepInterval. Normal runs clean up after themselves, so the
+// app-tmp sweep usually finds nothing; the legacy sweep keeps reaping
+// system-temp dirs leaked by older builds as they age past the gate.
+func (b *Bridge) maybeSweepTmp() {
+	b.mu.Lock()
+	due := now().Sub(b.lastTmpSweep) >= signalTmpSweepInterval
+	if due {
+		b.lastTmpSweep = now()
+	}
+	b.mu.Unlock()
+	if due {
+		b.goTracked(func() {
+			sweepSignalTmpRoot(b.logger, signalRunTmpMaxAge)
+			sweepLegacyLibsignalTemp(b.logger)
+		})
+	}
+}
+
+func (b *Bridge) refreshMetadataAndReplay(account string) {
+	b.refreshContacts()
+	b.refreshGroupNames()
+	b.drainReceiveWAL(account)
+	b.replayReceiveRecoveryQueue(account)
+}
+
+func (b *Bridge) requestSync(account string) error {
+	account = normalizeSignalAddress(account)
+	if account == "" {
+		return errors.New("signal account is not paired")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), syncRequestTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, "-a", account, "sendSyncRequest")
+	b.commandMu.Unlock()
+	if err != nil {
+		return commandError("request Signal device sync", err, output)
+	}
+	return nil
+}
+
+func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
+	// Durability: signal-cli ACKs the batch to Signal's servers as it
+	// streams it to stdout. If we crash between reading `output` and
+	// committing the DB rows, those messages are gone from the server
+	// forever. Persist the raw batch to a write-ahead log before we
+	// process any of it; drainReceiveWAL on startup replays anything
+	// we didn't finish processing cleanly. DB writes are idempotent
+	// (source_id uniqueness), so replay is safe even for lines we did
+	// commit before the crash.
+	walPath := b.receiveWALPath()
+	if err := appendReceiveWAL(walPath, account, output); err != nil {
+		b.logger.Warn().Err(err).Msg("Failed to persist signal-cli batch to WAL — continuing with best-effort processing")
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		if _, err := b.processReceiveLine(account, scanner.Bytes(), true); err != nil {
+			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		// Leave the WAL in place — startup drain will retry.
+		return err
+	}
+	// All lines processed (or quarantined to recovery). Drop the WAL.
+	_ = os.Remove(walPath)
+	return nil
+}
+
+func (b *Bridge) receiveWALPath() string {
+	return filepath.Join(b.configDir, "signal-receive-wal.ndjson")
+}
+
+// appendReceiveWAL writes every JSON line in `output` to the WAL under a
+// shared lock so concurrent receive polls append atomically. fsync after
+// the write so a crash between signal-cli ACK and DB commit doesn't lose
+// the batch.
+func appendReceiveWAL(path, account string, output []byte) error {
+	output = bytes.TrimSpace(output)
+	if len(output) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	nowMS := now().UnixMilli()
+	account = normalizeSignalAddress(account)
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		record := signalReceiveRecoveryRecord{
+			TimestampMS: nowMS,
+			Account:     account,
+			Reason:      "wal",
+			Raw:         string(line),
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(append(encoded, '\n')); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return file.Sync()
+}
+
+// drainReceiveWAL re-processes any WAL entries left over from a prior
+// crash or shutdown. Called from startup (refreshMetadataAndReplay)
+// before the receive loop begins polling signal-cli again.
+func (b *Bridge) drainReceiveWAL(account string) {
+	if b == nil {
+		return
+	}
+	path := b.receiveWALPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			b.logger.Debug().Err(err).Msg("Failed to read Signal receive WAL")
+		}
+		return
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		_ = os.Remove(path)
+		return
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	replayed := 0
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			continue
+		}
+		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
+		if _, err := b.processReceiveLine(replayAccount, []byte(record.Raw), true); err != nil {
+			b.logger.Debug().Err(err).Msg("Failed to replay Signal WAL entry")
+		}
+		replayed++
+	}
+	_ = os.Remove(path)
+	if replayed > 0 {
+		b.logger.Info().Int("replayed", replayed).Msg("Drained Signal receive WAL after restart")
+	}
+}
+
+func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecovery bool) (bool, error) {
+	line := bytes.TrimSpace(rawLine)
+	if len(line) == 0 {
+		return true, nil
+	}
+	if line[0] != '{' {
+		return true, nil
+	}
+	payloadAccount, env, err := ParseReceiveEnvelope(account, line)
+	if err != nil {
+		if allowRecovery {
+			b.recordReceiveRecoveryIssue(account, line, "unmarshal_failed", err)
+		}
+		return false, nil
+	}
+	resolvedSource := b.resolveContactAddressAtCapture(signalEnvelopeSource(&env))
+	resolvedDestination := ""
+	if env.SyncMessage != nil {
+		resolvedDestination = b.resolveContactAddressAtCapture(signalSentTarget(env.SyncMessage.SentMessage))
+	}
+	b.observeIngress(payloadAccount, line, resolvedSource, resolvedDestination)
+	if reason := signalEnvelopeRecoveryReason(&env); reason != "" {
+		if allowRecovery {
+			b.recordReceiveRecoveryIssue(payloadAccount, line, reason, nil)
+		}
+		return false, nil
+	}
+	if env.TypingMessage != nil {
+		b.handleTypingMessage(payloadAccount, &env)
+	}
+	if env.EditMessage != nil {
+		if err := b.handleEditMessage(payloadAccount, &env, !allowRecovery); err != nil {
+			if allowRecovery {
+				b.recordReceiveRecoveryIssue(payloadAccount, line, "handle_edit_message_failed", err)
+			}
+			return false, fmt.Errorf("apply Signal edit: %w", err)
+		}
+	}
+	if env.DataMessage != nil {
+		if err := b.handleDataMessage(payloadAccount, &env); err != nil {
+			if allowRecovery {
+				b.recordReceiveRecoveryIssue(payloadAccount, line, "handle_data_message_failed", err)
+			}
+			return false, fmt.Errorf("store Signal message: %w", err)
+		}
+	}
+	if env.SyncMessage != nil && env.SyncMessage.SentMessage != nil {
+		if err := b.handleSentMessage(payloadAccount, &env, !allowRecovery); err != nil {
+			if allowRecovery {
+				b.recordReceiveRecoveryIssue(payloadAccount, line, "handle_sent_message_failed", err)
+			}
+			return false, fmt.Errorf("store Signal sent sync message: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// ParseReceiveEnvelope decodes the exact receive payload shape used by
+// processReceiveLine, including signal-cli's result-envelope fallback. It is
+// pure so durable decoders can share the retained receiver's JSON contract.
+func ParseReceiveEnvelope(fallbackAccount string, line []byte) (string, Envelope, error) {
+	var payload signalReceivePayload
+	if err := json.Unmarshal(line, &payload); err != nil {
+		return "", Envelope{}, err
+	}
+	env := payload.Envelope
+	payloadAccount := strings.TrimSpace(payload.Account)
+	if payload.Result != nil {
+		if payloadAccount == "" {
+			payloadAccount = strings.TrimSpace(payload.Result.Account)
+		}
+		if env.Timestamp == 0 && env.Source == "" && env.SourceNumber == "" && env.SourceUUID == "" && env.SourceServiceID == "" && env.DataMessage == nil && env.EditMessage == nil && env.SyncMessage == nil && env.TypingMessage == nil {
+			env = payload.Result.Envelope
+		}
+	}
+	if payloadAccount == "" {
+		payloadAccount = fallbackAccount
+	}
+	return payloadAccount, env, nil
+}
+
+func (b *Bridge) recordReceiveRecoveryIssue(account string, rawLine []byte, reason string, err error) {
+	if err := b.appendReceiveRecoveryRecord(account, rawLine, reason, err); err != nil {
+		b.logger.Warn().Err(err).Str("reason", reason).Msg("Failed to quarantine Signal receive payload")
+	}
+	if !b.shouldTriggerReceiveRecovery() {
+		return
+	}
+	account = normalizeSignalAddress(account)
+	if account == "" {
+		return
+	}
+	b.beginHistorySync()
+	b.emitStatusChange()
+	b.goTracked(func() {
+		if syncErr := b.requestSync(account); syncErr != nil {
+			b.logger.Debug().Err(syncErr).Str("reason", reason).Msg("Failed to request Signal recovery sync")
+		}
+	})
+}
+
+func (b *Bridge) appendReceiveRecoveryRecord(account string, rawLine []byte, reason string, cause error) error {
+	b.recoveryMu.Lock()
+	defer b.recoveryMu.Unlock()
+	account = normalizeSignalAddress(account)
+	if err := os.MkdirAll(b.configDir, 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(b.receiveRecoveryPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	record := signalReceiveRecoveryRecord{
+		TimestampMS: now().UnixMilli(),
+		Account:     account,
+		Reason:      strings.TrimSpace(reason),
+		Raw:         string(rawLine),
+	}
+	if cause != nil {
+		record.Error = cause.Error()
+	}
+	encoded, marshalErr := json.Marshal(record)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	if _, writeErr := file.Write(append(encoded, '\n')); writeErr != nil {
+		return writeErr
+	}
+	return nil
+}
+
+func (b *Bridge) replayReceiveRecoveryQueue(account string) {
+	if b == nil {
+		return
+	}
+	path := b.receiveRecoveryPath()
+	b.recoveryMu.Lock()
+	defer b.recoveryMu.Unlock()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			b.logger.Debug().Err(err).Msg("Failed to read Signal receive recovery queue")
+		}
+		return
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	remaining := make([][]byte, 0)
+	recovered := 0
+	for scanner.Scan() {
+		recordLine := bytes.TrimSpace(scanner.Bytes())
+		if len(recordLine) == 0 {
+			continue
+		}
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(recordLine, &record); err != nil {
+			remaining = append(remaining, append([]byte(nil), recordLine...))
+			continue
+		}
+		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
+		resolved, err := b.processReceiveLine(replayAccount, []byte(record.Raw), false)
+		if err != nil {
+			b.logger.Debug().Err(err).Str("reason", record.Reason).Msg("Failed to replay Signal recovery payload")
+		}
+		if resolved {
+			recovered++
+			continue
+		}
+		remaining = append(remaining, append([]byte(nil), recordLine...))
+	}
+	if err := scanner.Err(); err != nil {
+		b.logger.Debug().Err(err).Msg("Failed to scan Signal receive recovery queue")
+		return
+	}
+	if err := rewriteRecoveryQueue(path, remaining); err != nil {
+		b.logger.Warn().Err(err).Msg("Failed to rewrite Signal receive recovery queue")
+		return
+	}
+	if recovered > 0 {
+		b.logger.Debug().Int("recovered", recovered).Msg("Replayed Signal recovery payloads")
+	}
+}
+
+func rewriteRecoveryQueue(path string, lines [][]byte) error {
+	if len(lines) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	tempPath := path + ".tmp"
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if _, err := file.Write(bytes.TrimSpace(line)); err != nil {
+			file.Close()
+			return err
+		}
+		if _, err := file.Write([]byte{'\n'}); err != nil {
+			file.Close()
+			return err
+		}
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func (b *Bridge) receiveRecoveryPath() string {
+	return filepath.Join(b.configDir, "signal-receive-recovery.ndjson")
+}
+
+func (b *Bridge) receiveRecoveryStatus() *ReceiveRecoveryStatus {
+	if b == nil {
+		return nil
+	}
+	b.recoveryMu.Lock()
+	defer b.recoveryMu.Unlock()
+	raw, err := os.ReadFile(b.receiveRecoveryPath())
+	if err != nil {
+		return nil
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	status := &ReceiveRecoveryStatus{}
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		status.PendingCount++
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			if status.LastIssueAt == 0 && status.LastIssueReason == "" {
+				status.LastIssueReason = "invalid_record"
+			}
+			continue
+		}
+		if record.TimestampMS >= status.LastIssueAt {
+			status.LastIssueAt = record.TimestampMS
+			status.LastIssueReason = strings.TrimSpace(record.Reason)
+		}
+	}
+	if status.PendingCount == 0 {
+		return nil
+	}
+	return status
+}
+
+func (b *Bridge) shouldTriggerReceiveRecovery() bool {
+	nowMS := now().UnixMilli()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if nowMS-b.lastReceiveRecoveryAt < int64(receiveRecoveryWindow/time.Millisecond) {
+		return false
+	}
+	b.lastReceiveRecoveryAt = nowMS
+	return true
+}
+
+func signalEnvelopeRecoveryReason(env *signalEnvelope) string {
+	if env == nil {
+		return ""
+	}
+	if env.EditMessage != nil {
+		groupID := ""
+		if info := signalEditGroupInfo(env.EditMessage); info != nil {
+			groupID = strings.TrimSpace(info.GroupID)
+		}
+		if signalEnvelopeSource(env) == "" && groupID == "" {
+			return "missing_edit_message_source"
+		}
+	}
+	if env.DataMessage != nil {
+		groupID := ""
+		if env.DataMessage.GroupInfo != nil {
+			groupID = strings.TrimSpace(env.DataMessage.GroupInfo.GroupID)
+		}
+		if signalEnvelopeSource(env) == "" && groupID == "" {
+			return "missing_data_message_source"
+		}
+	}
+	if env.SyncMessage != nil && env.SyncMessage.SentMessage != nil {
+		groupID := ""
+		if info := signalSentGroupInfo(env.SyncMessage.SentMessage); info != nil {
+			groupID = strings.TrimSpace(info.GroupID)
+		}
+		if signalSentTarget(env.SyncMessage.SentMessage) == "" && groupID == "" {
+			return "missing_sent_message_target"
+		}
+	}
+	return ""
+}
+
+func (b *Bridge) handleTypingMessage(account string, env *signalEnvelope) {
+	if env == nil || env.TypingMessage == nil || b.callbacks.OnTypingChange == nil {
+		return
+	}
+	source := b.resolveContactAddress(signalEnvelopeSource(env))
+	if source == "" || addressesMatch(source, account) {
+		return
+	}
+	groupID := ""
+	if env.TypingMessage.GroupInfo != nil {
+		groupID = strings.TrimSpace(env.TypingMessage.GroupInfo.GroupID)
+	}
+	conversationID := signalConversationID(source, groupID)
+	typing := strings.EqualFold(strings.TrimSpace(env.TypingMessage.Action), "started")
+	b.callbacks.OnTypingChange(conversationID, firstNonEmpty(strings.TrimSpace(env.SourceName), source), source, typing)
+}
+
+func (b *Bridge) handleDataMessage(account string, env *signalEnvelope) error {
+	if env == nil || env.DataMessage == nil {
+		return nil
+	}
+
+	source := b.resolveContactAddress(signalEnvelopeSource(env))
+	groupID := ""
+	groupTitle := ""
+	if env.DataMessage.GroupInfo != nil {
+		groupID = strings.TrimSpace(env.DataMessage.GroupInfo.GroupID)
+		groupTitle = signalGroupTitle(env.DataMessage.GroupInfo)
+	}
+	if groupTitle == "" && groupID != "" {
+		groupTitle = b.groupName(groupID)
+	}
+	if source == "" && groupID == "" {
+		return nil
+	}
+
+	conversationID := signalConversationID(source, groupID)
+	if env.DataMessage.Reaction != nil {
+		return b.applyReactionToConversation(conversationID, env.DataMessage.Reaction, b.resolveContactAddress(signalReactionActorID(env)), account)
+	}
+
+	isFromMe := source != "" && addressesMatch(source, account)
+	if isFromMe {
+		return nil
+	}
+
+	timestamp := env.DataMessage.Timestamp
+	if timestamp == 0 {
+		timestamp = env.Timestamp
+	}
+	body := env.DataMessage.displayBody()
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, source, false); placeholder != nil {
+		body = firstNonEmpty(strings.TrimSpace(placeholder.Body), body)
+	}
+	name := firstNonEmpty(strings.TrimSpace(env.SourceName), source)
+	sourceID := signalIncomingSourceID(conversationID, source, timestamp, body)
+	messageID := "signal:" + sourceID
+	existingMsg, _ := b.store.GetMessageByID(messageID)
+
+	existing, _ := b.store.GetConversation(conversationID)
+	convo := &db.Conversation{
+		ConversationID: conversationID,
+		Name:           name,
+		IsGroup:        groupID != "",
+		LastMessageTS:  timestamp,
+		UnreadCount:    1,
+		SourcePlatform: "signal",
+		Participants:   "[]",
+	}
+	if existing != nil {
+		*convo = *existing
+		convo.LastMessageTS = maxInt64(existing.LastMessageTS, timestamp)
+		convo.IsGroup = groupID != ""
+		convo.SourcePlatform = "signal"
+		convo.UnreadCount = existing.UnreadCount
+		if existingMsg == nil {
+			convo.UnreadCount = existing.UnreadCount + 1
+		}
+	}
+	if convo.IsGroup {
+		if groupTitle != "" {
+			convo.Name = groupTitle
+		} else if convo.Name == "" {
+			convo.Name = "Signal Group"
+		}
+	} else {
+		if convo.Name == "" {
+			convo.Name = source
+		}
+		if participants, err := marshalParticipants([]participantJSON{{
+			Name:   firstNonEmpty(name, source),
+			Number: source,
+		}}); err == nil {
+			convo.Participants = participants
+		}
+	}
+	if err := b.store.UpsertConversation(convo); err != nil {
+		return err
+	}
+
+	msg := &db.Message{
+		MessageID:      messageID,
+		ConversationID: conversationID,
+		SenderName:     firstNonEmpty(name, convo.Name, source),
+		SenderNumber:   source,
+		Body:           body,
+		TimestampMS:    timestamp,
+		Status:         "received",
+		IsFromMe:       false,
+		MentionsMe:     signalMentionsMe(env.DataMessage.Mentions, account),
+		ReplyToID:      signalQuoteReplyID(conversationID, env.DataMessage.Quote),
+		SourcePlatform: "signal",
+		SourceID:       sourceID,
+	}
+	if len(env.DataMessage.Attachments) > 0 {
+		msg.MimeType = strings.TrimSpace(env.DataMessage.Attachments[0].ContentType)
+		msg.MediaID = encodeSignalAttachmentRef(env.DataMessage.Attachments[0].ID)
+	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, source, false); placeholder != nil {
+		mergeSignalMissingEditPlaceholder(msg, placeholder)
+	}
+	if err := b.store.UpsertMessage(msg); err != nil {
+		return err
+	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, source, false); placeholder != nil && placeholder.MessageID != msg.MessageID {
+		if err := b.store.DeleteMessageByID(placeholder.MessageID); err != nil {
+			b.logger.Debug().Err(err).Str("placeholder_msg_id", placeholder.MessageID).Msg("Failed to delete superseded Signal missing-edit placeholder")
+		}
+	}
+	b.recordHistorySyncProgress(existing == nil, existingMsg == nil)
+	if existingMsg == nil && b.callbacks.OnIncomingMessage != nil {
+		b.callbacks.OnIncomingMessage(msg)
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(conversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+	return nil
+}
+
+func (b *Bridge) handleEditMessage(account string, env *signalEnvelope, synthesizeOnMissing bool) error {
+	if env == nil || env.EditMessage == nil || env.EditMessage.DataMessage == nil {
+		return nil
+	}
+
+	source := b.resolveContactAddress(signalEnvelopeSource(env))
+	groupID := ""
+	groupTitle := ""
+	if info := signalEditGroupInfo(env.EditMessage); info != nil {
+		groupID = strings.TrimSpace(info.GroupID)
+		groupTitle = signalGroupTitle(info)
+	}
+	if groupTitle == "" && groupID != "" {
+		groupTitle = b.groupName(groupID)
+	}
+	if source == "" && groupID == "" {
+		return nil
+	}
+	if source != "" && addressesMatch(source, account) {
+		return nil
+	}
+	conversationID := signalConversationID(source, groupID)
+	if err := b.ensureSignalConversation(conversationID, source, groupID, groupTitle, firstNonEmpty(strings.TrimSpace(env.SourceName), source), env.Timestamp, "signal", 0); err != nil {
+		return err
+	}
+	err := b.applySignalEdit(conversationID, env.EditMessage.TargetSentTimestamp, source, env.EditMessage.DataMessage, account)
+	if err == nil || !errors.Is(err, errSignalEditTargetNotFound) || !synthesizeOnMissing {
+		return err
+	}
+	return b.materializeMissingSignalEdit(signalMissingEditArgs{
+		ConversationID: conversationID,
+		TimestampMS:    env.EditMessage.TargetSentTimestamp,
+		SenderName:     firstNonEmpty(strings.TrimSpace(env.SourceName), source),
+		SenderNumber:   source,
+		Body:           env.EditMessage.DataMessage.displayBody(),
+		ReplyToID:      signalQuoteReplyID(conversationID, env.EditMessage.DataMessage.Quote),
+		DataMessage:    env.EditMessage.DataMessage,
+		Account:        account,
+		IsFromMe:       false,
+		Status:         "received",
+	})
+}
+
+func (b *Bridge) handleSentMessage(account string, env *signalEnvelope, synthesizeOnMissing bool) error {
+	if env == nil || env.SyncMessage == nil || env.SyncMessage.SentMessage == nil {
+		return nil
+	}
+
+	sent := env.SyncMessage.SentMessage
+	if sent.EditMessage != nil {
+		return b.handleSentEditMessage(account, env, synthesizeOnMissing)
+	}
+	groupID := ""
+	groupTitle := ""
+	if info := signalSentGroupInfo(sent); info != nil {
+		groupID = strings.TrimSpace(info.GroupID)
+		groupTitle = signalGroupTitle(info)
+	}
+	if groupTitle == "" && groupID != "" {
+		groupTitle = b.groupName(groupID)
+	}
+	target := b.resolveContactAddress(signalSentTarget(sent))
+	if target == "" && groupID == "" {
+		return nil
+	}
+
+	conversationID := signalConversationID(target, groupID)
+	if sent.Reaction != nil {
+		return b.applyReactionToConversation(conversationID, sent.Reaction, b.resolveContactAddress(account), account)
+	}
+
+	timestamp := sent.Timestamp
+	if timestamp == 0 {
+		timestamp = env.Timestamp
+	}
+	body := sent.displayBody()
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, account, true); placeholder != nil {
+		body = firstNonEmpty(strings.TrimSpace(placeholder.Body), body)
+	}
+
+	existingMsg := b.matchLocalOutgoingMessage(conversationID, body, timestamp)
+	messageID := localOutgoingMessageID(conversationID, timestamp, body)
+	messageTimestamp := timestamp
+	replyToID := signalQuoteReplyID(conversationID, sent.Quote)
+	if existingMsg != nil {
+		messageID = existingMsg.MessageID
+		if existingMsg.TimestampMS > 0 {
+			messageTimestamp = existingMsg.TimestampMS
+		}
+		if replyToID == "" {
+			replyToID = existingMsg.ReplyToID
+		}
+	}
+
+	existing, _ := b.store.GetConversation(conversationID)
+	convo := &db.Conversation{
+		ConversationID: conversationID,
+		Name:           target,
+		IsGroup:        groupID != "",
+		LastMessageTS:  maxInt64(messageTimestamp, timestamp),
+		UnreadCount:    0,
+		SourcePlatform: "signal",
+		Participants:   "[]",
+	}
+	if existing != nil {
+		*convo = *existing
+		convo.LastMessageTS = maxInt64(existing.LastMessageTS, maxInt64(messageTimestamp, timestamp))
+		convo.IsGroup = groupID != ""
+		convo.SourcePlatform = "signal"
+	}
+	if convo.IsGroup {
+		if groupTitle != "" {
+			convo.Name = groupTitle
+		} else if convo.Name == "" {
+			convo.Name = "Signal Group"
+		}
+	} else {
+		if convo.Name == "" {
+			convo.Name = target
+		}
+		if participants, err := marshalParticipants([]participantJSON{{
+			Name:   firstNonEmpty(convo.Name, target),
+			Number: target,
+		}}); err == nil {
+			convo.Participants = participants
+		}
+	}
+	if err := b.store.UpsertConversation(convo); err != nil {
+		return err
+	}
+
+	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	msg := &db.Message{
+		MessageID:      messageID,
+		ConversationID: conversationID,
+		SenderName:     senderName,
+		SenderNumber:   account,
+		Body:           body,
+		TimestampMS:    messageTimestamp,
+		Status:         "sent",
+		IsFromMe:       true,
+		ReplyToID:      replyToID,
+		SourcePlatform: "signal",
+		SourceID:       strings.TrimPrefix(messageID, "signal:"),
+	}
+	if len(sent.Attachments) > 0 {
+		if existingMsg != nil {
+			cleanupLocalSignalAttachment(existingMsg.MediaID)
+		}
+		msg.MimeType = strings.TrimSpace(sent.Attachments[0].ContentType)
+		msg.MediaID = encodeSignalAttachmentRef(sent.Attachments[0].ID)
+	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, account, true); placeholder != nil {
+		mergeSignalMissingEditPlaceholder(msg, placeholder)
+	}
+	if err := b.store.UpsertMessage(msg); err != nil {
+		return err
+	}
+	if placeholder := b.findSignalMissingEditAlias(conversationID, timestamp, account, true); placeholder != nil && placeholder.MessageID != msg.MessageID {
+		if err := b.store.DeleteMessageByID(placeholder.MessageID); err != nil {
+			b.logger.Debug().Err(err).Str("placeholder_msg_id", placeholder.MessageID).Msg("Failed to delete superseded Signal missing-edit placeholder")
+		}
+	}
+	b.recordHistorySyncProgress(existing == nil, existingMsg == nil)
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(conversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+	return nil
+}
+
+func (b *Bridge) handleSentEditMessage(account string, env *signalEnvelope, synthesizeOnMissing bool) error {
+	if env == nil || env.SyncMessage == nil || env.SyncMessage.SentMessage == nil || env.SyncMessage.SentMessage.EditMessage == nil {
+		return nil
+	}
+
+	sent := env.SyncMessage.SentMessage
+	groupID := ""
+	groupTitle := ""
+	if info := signalSentGroupInfo(sent); info != nil {
+		groupID = strings.TrimSpace(info.GroupID)
+		groupTitle = signalGroupTitle(info)
+	}
+	if groupTitle == "" && groupID != "" {
+		groupTitle = b.groupName(groupID)
+	}
+	target := b.resolveContactAddress(signalSentTarget(sent))
+	if target == "" && groupID == "" {
+		return nil
+	}
+	conversationID := signalConversationID(target, groupID)
+	if err := b.ensureSignalConversation(conversationID, target, groupID, groupTitle, target, env.Timestamp, "signal", 0); err != nil {
+		return err
+	}
+	err := b.applySignalEdit(conversationID, sent.EditMessage.TargetSentTimestamp, b.resolveContactAddress(account), sent.EditMessage.DataMessage, account)
+	if err == nil || !errors.Is(err, errSignalEditTargetNotFound) || !synthesizeOnMissing {
+		return err
+	}
+	return b.materializeMissingSignalEdit(signalMissingEditArgs{
+		ConversationID: conversationID,
+		TimestampMS:    sent.EditMessage.TargetSentTimestamp,
+		SenderName:     firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me"),
+		SenderNumber:   account,
+		Body:           sent.EditMessage.DataMessage.displayBody(),
+		ReplyToID:      signalQuoteReplyID(conversationID, sent.EditMessage.DataMessage.Quote),
+		DataMessage:    sent.EditMessage.DataMessage,
+		Account:        account,
+		IsFromMe:       true,
+		Status:         "sent",
+	})
+}
+
+func (b *Bridge) ensureSignalConversation(conversationID, target, groupID, groupTitle, fallbackName string, timestamp int64, platform string, unreadDelta int) error {
+	if b == nil || b.store == nil || conversationID == "" {
+		return nil
+	}
+	existing, _ := b.store.GetConversation(conversationID)
+	convo := &db.Conversation{
+		ConversationID: conversationID,
+		Name:           fallbackName,
+		IsGroup:        groupID != "",
+		LastMessageTS:  timestamp,
+		UnreadCount:    maxInt(0, unreadDelta),
+		SourcePlatform: platform,
+		Participants:   "[]",
+	}
+	if existing != nil {
+		*convo = *existing
+		convo.LastMessageTS = maxInt64(existing.LastMessageTS, timestamp)
+		convo.IsGroup = groupID != ""
+		convo.SourcePlatform = platform
+		convo.UnreadCount = maxInt(0, existing.UnreadCount+unreadDelta)
+	}
+	if convo.IsGroup {
+		if groupTitle != "" {
+			convo.Name = groupTitle
+		} else if convo.Name == "" {
+			convo.Name = "Signal Group"
+		}
+	} else {
+		if convo.Name == "" {
+			convo.Name = target
+		}
+		if participants, err := marshalParticipants([]participantJSON{{
+			Name:   firstNonEmpty(convo.Name, fallbackName, target),
+			Number: target,
+		}}); err == nil {
+			convo.Participants = participants
+		}
+	}
+	return b.store.UpsertConversation(convo)
+}
+
+func (b *Bridge) applySignalEdit(conversationID string, targetTimestamp int64, targetAuthor string, dataMessage *signalDataMessage, account string) error {
+	if b == nil || b.store == nil || targetTimestamp == 0 || dataMessage == nil {
+		return nil
+	}
+	targetMessage, err := b.findTimestampTarget(conversationID, targetTimestamp, b.resolveContactAddress(targetAuthor))
+	if err != nil {
+		return err
+	}
+	if targetMessage == nil {
+		return errSignalEditTargetNotFound
+	}
+	updated := *targetMessage
+	updated.Body = dataMessage.displayBody()
+	updated.MentionsMe = signalMentionsMe(dataMessage.Mentions, account)
+	if replyToID := signalQuoteReplyID(conversationID, dataMessage.Quote); replyToID != "" {
+		updated.ReplyToID = replyToID
+	}
+	if len(dataMessage.Attachments) > 0 {
+		updated.MimeType = strings.TrimSpace(dataMessage.Attachments[0].ContentType)
+		updated.MediaID = encodeSignalAttachmentRef(dataMessage.Attachments[0].ID)
+	}
+	if err := b.store.UpsertMessage(&updated); err != nil {
+		return err
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(conversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+	return nil
+}
+
+var errSignalEditTargetNotFound = errors.New("signal edit target not found")
+
+type signalMissingEditArgs struct {
+	ConversationID string
+	TimestampMS    int64
+	SenderName     string
+	SenderNumber   string
+	Body           string
+	ReplyToID      string
+	DataMessage    *signalDataMessage
+	Account        string
+	IsFromMe       bool
+	Status         string
+}
+
+func (b *Bridge) materializeMissingSignalEdit(args signalMissingEditArgs) error {
+	if b == nil || b.store == nil || strings.TrimSpace(args.ConversationID) == "" || args.DataMessage == nil {
+		return nil
+	}
+	timestamp := args.TimestampMS
+	if timestamp == 0 {
+		timestamp = args.DataMessage.Timestamp
+	}
+	if timestamp == 0 {
+		timestamp = now().UnixMilli()
+	}
+	sourceID := signalMissingEditSourceID(args.ConversationID, args.SenderNumber, timestamp)
+	msg := &db.Message{
+		MessageID:      "signal:" + sourceID,
+		ConversationID: args.ConversationID,
+		SenderName:     firstNonEmpty(strings.TrimSpace(args.SenderName), strings.TrimSpace(args.SenderNumber)),
+		SenderNumber:   strings.TrimSpace(args.SenderNumber),
+		Body:           strings.TrimSpace(args.Body),
+		TimestampMS:    timestamp,
+		Status:         firstNonEmpty(strings.TrimSpace(args.Status), "received"),
+		IsFromMe:       args.IsFromMe,
+		MentionsMe:     signalMentionsMe(args.DataMessage.Mentions, args.Account),
+		ReplyToID:      strings.TrimSpace(args.ReplyToID),
+		SourcePlatform: "signal",
+		SourceID:       sourceID,
+	}
+	if msg.Body == "" {
+		msg.Body = args.DataMessage.displayBody()
+	}
+	if len(args.DataMessage.Attachments) > 0 {
+		msg.MimeType = strings.TrimSpace(args.DataMessage.Attachments[0].ContentType)
+		msg.MediaID = encodeSignalAttachmentRef(args.DataMessage.Attachments[0].ID)
+	}
+	if err := b.store.UpsertMessage(msg); err != nil {
+		return err
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(args.ConversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+	return nil
+}
+
+func (b *Bridge) findSignalMissingEditAlias(conversationID string, timestampMS int64, senderNumber string, isFromMe bool) *db.Message {
+	if b == nil || b.store == nil || strings.TrimSpace(conversationID) == "" || timestampMS == 0 {
+		return nil
+	}
+	messages, err := b.store.GetMessagesByConversationAtTimestamp(conversationID, timestampMS, 10)
+	if err != nil {
+		return nil
+	}
+	senderNumber = normalizeSignalAddress(senderNumber)
+	var alias *db.Message
+	for _, message := range messages {
+		if message == nil || !strings.HasPrefix(strings.TrimSpace(message.SourceID), signalMissingEditSourcePrefix) {
+			continue
+		}
+		if message.IsFromMe != isFromMe {
+			continue
+		}
+		if senderNumber != "" && !addressesMatch(normalizeSignalAddress(message.SenderNumber), senderNumber) {
+			continue
+		}
+		if alias != nil {
+			return nil
+		}
+		alias = message
+	}
+	return alias
+}
+
+func mergeSignalMissingEditPlaceholder(target, placeholder *db.Message) {
+	if target == nil || placeholder == nil {
+		return
+	}
+	target.Body = firstNonEmpty(strings.TrimSpace(placeholder.Body), strings.TrimSpace(target.Body))
+	target.ReplyToID = firstNonEmpty(strings.TrimSpace(placeholder.ReplyToID), strings.TrimSpace(target.ReplyToID))
+	if placeholder.MentionsMe {
+		target.MentionsMe = true
+	}
+	if strings.TrimSpace(target.MediaID) == "" {
+		target.MediaID = strings.TrimSpace(placeholder.MediaID)
+	}
+	if strings.TrimSpace(target.MimeType) == "" {
+		target.MimeType = strings.TrimSpace(placeholder.MimeType)
+	}
+	if strings.TrimSpace(target.DecryptionKey) == "" {
+		target.DecryptionKey = strings.TrimSpace(placeholder.DecryptionKey)
+	}
+	if strings.TrimSpace(target.Reactions) == "" {
+		target.Reactions = strings.TrimSpace(placeholder.Reactions)
+	}
+}
+
+func (b *Bridge) applyReactionToConversation(conversationID string, reaction *signalReaction, actorID, account string) error {
+	if reaction == nil || b == nil || b.store == nil {
+		return nil
+	}
+	targetMessage, err := b.findReactionTarget(conversationID, reaction, account)
+	if err != nil {
+		return err
+	}
+	if targetMessage == nil {
+		return nil
+	}
+
+	action := ""
+	if reaction.IsRemove {
+		action = "remove"
+	}
+	nextReactions, changed, err := updateStoredReactions(targetMessage.Reactions, actorID, signalReactionStoreEmoji(reaction.Emoji, action))
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	targetMessage.Reactions = nextReactions
+	if err := b.store.UpdateMessageReactions(targetMessage.MessageID, nextReactions); err != nil {
+		return err
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(targetMessage.ConversationID)
+	}
+	return nil
+}
+
+func (b *Bridge) findReactionTarget(conversationID string, reaction *signalReaction, account string) (*db.Message, error) {
+	targetTimestamp := signalReactionTargetTimestamp(reaction)
+	if reaction == nil || targetTimestamp == 0 {
+		return nil, nil
+	}
+	targetAuthor := b.resolveContactAddress(signalReactionTargetAuthor(reaction, account))
+	return b.findTimestampTarget(conversationID, targetTimestamp, targetAuthor)
+}
+
+func (b *Bridge) findTimestampTarget(conversationID string, targetTimestamp int64, targetAuthor string) (*db.Message, error) {
+	if b == nil || b.store == nil || targetTimestamp == 0 {
+		return nil, nil
+	}
+	messages, err := b.store.GetMessagesByConversationAtTimestamp(conversationID, targetTimestamp, 10)
+	if err != nil {
+		return nil, err
+	}
+	if target := pickReactionTargetMessage(messages, targetAuthor, targetTimestamp); target != nil {
+		return target, nil
+	}
+	windowMS := int64(reactionMatchWindow / time.Millisecond)
+	messages, err = b.store.GetMessagesByConversationBetween(conversationID, targetTimestamp-windowMS, targetTimestamp+windowMS, 50)
+	if err != nil {
+		return nil, err
+	}
+	return pickReactionTargetMessage(messages, targetAuthor, targetTimestamp), nil
+}
+
+func pickReactionTargetMessage(messages []*db.Message, targetAuthor string, targetTimestamp int64) *db.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	var best *db.Message
+	bestDelta := int64(-1)
+	bestAuthorMatch := false
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		authorMatch := targetAuthor != "" && addressesMatch(normalizeSignalAddress(message.SenderNumber), targetAuthor)
+		if targetAuthor != "" && !authorMatch {
+			continue
+		}
+		delta := absInt64(message.TimestampMS - targetTimestamp)
+		if best == nil || delta < bestDelta || (!bestAuthorMatch && authorMatch) {
+			best = message
+			bestDelta = delta
+			bestAuthorMatch = authorMatch
+		}
+	}
+	if best != nil || targetAuthor != "" {
+		return best
+	}
+	for _, message := range messages {
+		if message != nil {
+			return message
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) emitStatusChange() {
+	if b.callbacks.OnStatusChange != nil {
+		b.callbacks.OnStatusChange()
+	}
+}
+
+func (b *Bridge) beginHistorySync() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.historySync.startedAt = now().UnixMilli()
+	b.historySync.lastImportAt = 0
+	b.historySync.importedConversations = 0
+	b.historySync.importedMessages = 0
+}
+
+func (b *Bridge) recordHistorySyncProgress(newConversation, newMessage bool) {
+	if !newConversation && !newMessage {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.historySync.startedAt == 0 {
+		return
+	}
+	if newConversation {
+		b.historySync.importedConversations++
+	}
+	if newMessage {
+		b.historySync.importedMessages++
+	}
+	b.historySync.lastImportAt = now().UnixMilli()
+}
+
+func (b *Bridge) historySyncSnapshotLocked() *HistorySyncSnapshot {
+	if b.historySync.startedAt == 0 {
+		return nil
+	}
+	activityAt := b.historySync.startedAt
+	if b.historySync.lastImportAt > activityAt {
+		activityAt = b.historySync.lastImportAt
+	}
+	running := now().UnixMilli()-activityAt < int64(historySyncQuietAfter/time.Millisecond)
+	snapshot := &HistorySyncSnapshot{
+		Running:               running,
+		StartedAt:             b.historySync.startedAt,
+		ImportedConversations: b.historySync.importedConversations,
+		ImportedMessages:      b.historySync.importedMessages,
+	}
+	if !running {
+		snapshot.CompletedAt = activityAt
+	}
+	return snapshot
+}
+
+func (b *Bridge) cancelBackgroundWork(clearPairQR bool) {
+	b.mu.Lock()
+	if b.pairCancel != nil {
+		b.pairCancel()
+		b.pairCancel = nil
+	}
+	if b.receiveCancel != nil {
+		b.receiveCancel()
+		b.receiveCancel = nil
+	}
+	if clearPairQR {
+		b.qr = QRSnapshot{}
+	}
+	b.mu.Unlock()
+}
+
+func (b *Bridge) usableAccount() (string, error) {
+	b.mu.RLock()
+	account := b.account
+	b.mu.RUnlock()
+	if account == "" {
+		account = b.firstStoredAccount()
+	}
+	if account == "" {
+		return "", errors.New("signal is not paired")
+	}
+	return account, nil
+}
+
+func (b *Bridge) probeAccount(ctx context.Context, expected string) (string, error) {
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, "--output", "json", "listAccounts")
+	b.commandMu.Unlock()
+	accounts := parseSignalAccounts(output)
+	if err != nil && len(accounts) == 0 {
+		return "", commandError("list Signal accounts", err, output)
+	}
+	if expected = normalizeSignalAddress(expected); expected != "" {
+		for _, account := range accounts {
+			if addressesMatch(account, expected) {
+				return account, nil
+			}
+		}
+	}
+	if len(accounts) > 0 {
+		return accounts[0], nil
+	}
+	return "", nil
+}
+
+func (b *Bridge) groupName(groupID string) string {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return ""
+	}
+	b.mu.RLock()
+	name := strings.TrimSpace(b.groupNames[groupID])
+	b.mu.RUnlock()
+	if name != "" {
+		return name
+	}
+	b.refreshGroupNames()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return strings.TrimSpace(b.groupNames[groupID])
+}
+
+func (b *Bridge) refreshGroupNames() {
+	if b == nil || b.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, "listGroups")
+	b.commandMu.Unlock()
+	groups := parseSignalGroups(output)
+	if err != nil && len(groups) == 0 {
+		b.logger.Debug().Err(commandError("list Signal groups", err, output)).Msg("Failed to refresh Signal groups")
+		return
+	}
+	if len(groups) == 0 {
+		return
+	}
+	b.mu.Lock()
+	for id, name := range groups {
+		b.groupNames[id] = name
+	}
+	b.mu.Unlock()
+
+	count, err := b.store.ConversationCount("signal")
+	if err != nil || count == 0 {
+		return
+	}
+	conversations, err := b.store.ListConversationsByPlatform("signal", count)
+	if err != nil {
+		return
+	}
+	changed := false
+	for _, convo := range conversations {
+		if convo == nil || !strings.HasPrefix(convo.ConversationID, "signal-group:") {
+			continue
+		}
+		groupID := strings.TrimPrefix(convo.ConversationID, "signal-group:")
+		name := strings.TrimSpace(groups[groupID])
+		if name == "" || name == strings.TrimSpace(convo.Name) {
+			continue
+		}
+		updated := *convo
+		updated.Name = name
+		if err := b.store.UpsertConversation(&updated); err != nil {
+			continue
+		}
+		changed = true
+	}
+	if changed && b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+}
+
+func (b *Bridge) resolveContactAddress(value string) string {
+	value = normalizeSignalAddress(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "+") {
+		return value
+	}
+	b.mu.RLock()
+	resolved := normalizeSignalAddress(b.contactByACI[value])
+	b.mu.RUnlock()
+	if resolved != "" {
+		return resolved
+	}
+	b.refreshContacts()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if resolved = normalizeSignalAddress(b.contactByACI[value]); resolved != "" {
+		return resolved
+	}
+	return value
+}
+
+// resolveContactAddressAtCapture resolves only from the already-loaded contact
+// cache. Unlike resolveContactAddress, it must not refresh contacts: capture is
+// on the durable tee boundary, where running signal-cli or mutating legacy
+// state would make observation change receive behavior.
+func (b *Bridge) resolveContactAddressAtCapture(value string) string {
+	value = normalizeSignalAddress(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "+") {
+		return value
+	}
+	b.mu.RLock()
+	resolved := normalizeSignalAddress(b.contactByACI[value])
+	b.mu.RUnlock()
+	return resolved
+}
+
+func (b *Bridge) refreshContacts() {
+	if b == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, "listContacts")
+	b.commandMu.Unlock()
+	contacts := parseSignalContacts(output)
+	if err != nil && len(contacts) == 0 {
+		b.logger.Debug().Err(commandError("list Signal contacts", err, output)).Msg("Failed to refresh Signal contacts")
+		return
+	}
+	if len(contacts) == 0 {
+		return
+	}
+	b.mu.Lock()
+	for aci, number := range contacts {
+		b.contactByACI[aci] = number
+	}
+	b.mu.Unlock()
+}
+
+func (b *Bridge) firstStoredAccount() string {
+	path := filepath.Join(b.configDir, "data", "accounts.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return firstSignalAccount(raw)
+}
+
+func parseSignalAccounts(raw []byte) []string {
+	accounts := decodedSignalAccounts(raw)
+	if len(accounts) > 0 {
+		sort.Strings(accounts)
+		return accounts
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		line := normalizeSignalAddress(scanner.Text())
+		if isSignalAccountAddress(line) {
+			accounts = append(accounts, line)
+		}
+	}
+	sort.Strings(accounts)
+	return accounts
+}
+
+func firstSignalAccount(raw []byte) string {
+	accounts := decodedSignalAccounts(raw)
+	if len(accounts) == 0 {
+		return ""
+	}
+	return accounts[0]
+}
+
+func decodedSignalAccounts(raw []byte) []string {
+	type signalAccount struct {
+		Number string `json:"number"`
+	}
+	seen := map[string]struct{}{}
+	accounts := make([]string, 0, 4)
+	appendAccount := func(number string) {
+		account := normalizeSignalAddress(number)
+		if !isSignalAccountAddress(account) {
+			return
+		}
+		if _, ok := seen[account]; ok {
+			return
+		}
+		seen[account] = struct{}{}
+		accounts = append(accounts, account)
+	}
+
+	var list []signalAccount
+	if err := json.Unmarshal(raw, &list); err == nil {
+		for _, item := range list {
+			appendAccount(item.Number)
+		}
+	}
+
+	var wrapped struct {
+		Accounts []signalAccount `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &wrapped); err == nil {
+		for _, item := range wrapped.Accounts {
+			appendAccount(item.Number)
+		}
+	}
+
+	return accounts
+}
+
+func updateStoredReactions(existingJSON, actorID, emoji string) (string, bool, error) {
+	reactions, err := parseStoredReactions(existingJSON)
+	if err != nil {
+		return "", false, err
+	}
+
+	actorID = strings.TrimSpace(actorID)
+	emoji = strings.TrimSpace(emoji)
+	changed := false
+
+	if actorID != "" {
+		for i := range reactions {
+			if idx := reactionActorIndex(reactions[i].Actors, actorID); idx >= 0 {
+				reactions[i].Actors = append(reactions[i].Actors[:idx], reactions[i].Actors[idx+1:]...)
+				if reactions[i].Count > 0 {
+					reactions[i].Count--
+				}
+				changed = true
+			}
+		}
+	}
+
+	if emoji != "" {
+		found := false
+		for i := range reactions {
+			if strings.TrimSpace(reactions[i].Emoji) != emoji {
+				continue
+			}
+			found = true
+			if actorID != "" && reactionActorIndex(reactions[i].Actors, actorID) < 0 {
+				reactions[i].Actors = append(reactions[i].Actors, actorID)
+			}
+			reactions[i].Emoji = emoji
+			reactions[i].Count++
+			changed = true
+			break
+		}
+		if !found {
+			entry := storedReaction{
+				Emoji: emoji,
+				Count: 1,
+			}
+			if actorID != "" {
+				entry.Actors = []string{actorID}
+			}
+			reactions = append(reactions, entry)
+			changed = true
+		}
+	}
+
+	compacted := make([]storedReaction, 0, len(reactions))
+	for _, reaction := range reactions {
+		reaction.Emoji = strings.TrimSpace(reaction.Emoji)
+		if reaction.Emoji == "" || reaction.Count <= 0 {
+			continue
+		}
+		compacted = append(compacted, reaction)
+	}
+	reactions = compacted
+
+	sort.Slice(reactions, func(i, j int) bool {
+		return reactions[i].Emoji < reactions[j].Emoji
+	})
+
+	if !changed {
+		return existingJSON, false, nil
+	}
+	if len(reactions) == 0 {
+		return "", true, nil
+	}
+
+	data, err := json.Marshal(reactions)
+	if err != nil {
+		return "", false, err
+	}
+	return string(data), true, nil
+}
+
+func parseStoredReactions(value string) ([]storedReaction, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	var reactions []storedReaction
+	if err := json.Unmarshal([]byte(value), &reactions); err != nil {
+		return nil, err
+	}
+	return reactions, nil
+}
+
+func reactionActorIndex(actors []string, actorID string) int {
+	for i, actor := range actors {
+		if actor == actorID {
+			return i
+		}
+	}
+	return -1
+}
+
+func parseSignalGroups(raw []byte) map[string]string {
+	groups := map[string]string{}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "Id: ") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "Id: ")
+		nameIndex := strings.Index(rest, " Name: ")
+		if nameIndex == -1 {
+			continue
+		}
+		groupID := strings.TrimSpace(rest[:nameIndex])
+		namePart := rest[nameIndex+len(" Name: "):]
+		activeIndex := strings.Index(namePart, "  Active: ")
+		if activeIndex != -1 {
+			namePart = namePart[:activeIndex]
+		}
+		name := strings.TrimSpace(namePart)
+		if groupID == "" || name == "" {
+			continue
+		}
+		groups[groupID] = name
+	}
+	return groups
+}
+
+func parseSignalContacts(raw []byte) map[string]string {
+	contacts := map[string]string{}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "Number: ") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "Number: ")
+		aciIndex := strings.Index(rest, " ACI: ")
+		if aciIndex == -1 {
+			continue
+		}
+		number := normalizeSignalAddress(strings.TrimSpace(rest[:aciIndex]))
+		remainder := rest[aciIndex+len(" ACI: "):]
+		nameIndex := strings.Index(remainder, " Name: ")
+		if nameIndex == -1 {
+			continue
+		}
+		aci := normalizeSignalAddress(strings.TrimSpace(remainder[:nameIndex]))
+		if aci == "" || number == "" {
+			continue
+		}
+		contacts[aci] = number
+	}
+	return contacts
+}
+
+func parseConversationTarget(conversationID string) (target string, isGroup bool, err error) {
+	conversationID = strings.TrimSpace(conversationID)
+	switch {
+	case strings.HasPrefix(conversationID, "signal-group:"):
+		target = strings.TrimSpace(strings.TrimPrefix(conversationID, "signal-group:"))
+		isGroup = true
+	case strings.HasPrefix(conversationID, "signal:"):
+		target = normalizeSignalAddress(strings.TrimPrefix(conversationID, "signal:"))
+	default:
+		err = fmt.Errorf("invalid Signal conversation id %q", conversationID)
+	}
+	if strings.TrimSpace(target) == "" && err == nil {
+		err = fmt.Errorf("missing Signal conversation target")
+	}
+	return
+}
+
+// ParseConversationTarget exposes the retained Signal conversation parser to
+// lifecycle adapters that must turn a Wave-4 media remote_ref into the exact
+// getAttachment recipient/group arguments. Keep parsing centralized here so
+// send and download paths cannot drift on signal:/signal-group: semantics.
+func ParseConversationTarget(conversationID string) (target string, isGroup bool, err error) {
+	return parseConversationTarget(conversationID)
+}
+
+func signalConversationID(address, groupID string) string {
+	if groupID = strings.TrimSpace(groupID); groupID != "" {
+		return "signal-group:" + groupID
+	}
+	return "signal:" + normalizeSignalAddress(address)
+}
+
+// SignalConversationID exposes the retained conversation-id mapping as a pure
+// helper for the durable decoder.
+func SignalConversationID(address, groupID string) string {
+	return signalConversationID(address, groupID)
+}
+
+func normalizeSignalAddress(value string) string {
+	return strings.TrimSpace(value)
+}
+
+func isSignalAccountAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || value[0] != '+' {
+		return false
+	}
+	for _, r := range value[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// signalIncomingSourceID computes a stable SHA-1 message id from a Signal
+// envelope. The body is deliberately NOT part of the hash: Signal identifies
+// a message by (sender, sent-timestamp) and an edit arrives as an update to
+// that same logical message. Hashing in the body would produce a different
+// id for each edit and manifest as duplicate rows in the thread. The body
+// argument remains for call-site symmetry but is unused — retained so all
+// call sites still pass it as a reminder that body changes must not shift
+// the identity.
+func signalIncomingSourceID(conversationID, sender string, timestamp int64, body string) string {
+	_ = body
+	sum := sha1.Sum([]byte(strings.Join([]string{
+		strings.TrimSpace(conversationID),
+		strings.TrimSpace(sender),
+		strconv.FormatInt(timestamp, 10),
+	}, "\x1f")))
+	return hex.EncodeToString(sum[:])
+}
+
+func localOutgoingMessageID(conversationID string, timestamp int64, body string) string {
+	return "signal:local:" + signalIncomingSourceID(conversationID, "me", timestamp, body)
+}
+
+func signalMissingEditSourceID(conversationID, sender string, timestamp int64) string {
+	sum := sha1.Sum([]byte(strings.Join([]string{
+		"missing-edit",
+		strings.TrimSpace(conversationID),
+		strings.TrimSpace(sender),
+		strconv.FormatInt(timestamp, 10),
+	}, "\x1f")))
+	return signalMissingEditSourcePrefix + hex.EncodeToString(sum[:])
+}
+
+func (b *Bridge) matchLocalOutgoingMessage(conversationID, body string, timestamp int64) *db.Message {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	msgs, err := b.store.GetMessagesByConversation(conversationID, 25)
+	if err != nil {
+		return nil
+	}
+	// Exact identity first: web-sent media rows persist the transport timestamp
+	// as their MessageID ("signal:<ts>"), and a SentMessage sync transcript
+	// carries that same sender timestamp — a deterministic match, stronger than
+	// the body+drift heuristic below and immune to caption/placeholder drift.
+	// Without this, every web-sent media message duplicates on history sync.
+	timestampID := "signal:" + strconv.FormatInt(timestamp, 10)
+	for _, msg := range msgs {
+		if msg == nil || !msg.IsFromMe || msg.SourcePlatform != "signal" {
+			continue
+		}
+		if msg.MessageID == timestampID {
+			return msg
+		}
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil
+	}
+	var nearestDriftMS int64 = -1
+	bodyMismatchSample := ""
+	for _, msg := range msgs {
+		if msg == nil || !msg.IsFromMe || msg.SourcePlatform != "signal" {
+			continue
+		}
+		if !strings.HasPrefix(msg.MessageID, "signal:local:") {
+			continue
+		}
+		trimmed := strings.TrimSpace(msg.Body)
+		drift := absInt64(msg.TimestampMS - timestamp)
+		if trimmed != body {
+			if bodyMismatchSample == "" && drift <= int64(30*time.Second/time.Millisecond) {
+				bodyMismatchSample = trimmed
+			}
+			continue
+		}
+		if drift > int64(15*time.Second/time.Millisecond) {
+			if nearestDriftMS < 0 || drift < nearestDriftMS {
+				nearestDriftMS = drift
+			}
+			continue
+		}
+		return msg
+	}
+	if nearestDriftMS > 0 || bodyMismatchSample != "" {
+		b.logger.Warn().
+			Str("conversation", conversationID).
+			Int64("incoming_ts_ms", timestamp).
+			Int64("nearest_drift_ms", nearestDriftMS).
+			Str("body_preview", truncateForLog(body, 80)).
+			Str("local_body_preview", truncateForLog(bodyMismatchSample, 80)).
+			Msg("Signal outgoing dedup missed — may produce duplicate media/text row")
+	}
+	return nil
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+func signalQuoteReplyID(conversationID string, quote *signalQuotedMessage) string {
+	if quote == nil || quote.Timestamp == 0 {
+		return ""
+	}
+	author := normalizeSignalAddress(firstNonEmpty(quote.AuthorACI, quote.Author))
+	if author == "" {
+		author = "unknown"
+	}
+	sourceID := signalIncomingSourceID(conversationID, author, quote.Timestamp, strings.TrimSpace(quote.Text))
+	return "signal:" + sourceID
+}
+
+func signalMentionsMe(mentions []signalMention, account string) bool {
+	account = normalizeSignalAddress(account)
+	if account == "" {
+		return false
+	}
+	for _, mention := range mentions {
+		targets := []string{
+			mention.Number,
+			mention.RecipientNumber,
+			mention.Recipient,
+		}
+		for _, target := range targets {
+			if addressesMatch(target, account) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func signalReactionActorID(env *signalEnvelope) string {
+	if env == nil {
+		return ""
+	}
+	return signalEnvelopeSource(env)
+}
+
+func signalReactionTargetAuthor(reaction *signalReaction, account string) string {
+	if reaction == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		reaction.Target.AuthorNumber,
+		reaction.Target.AuthorACI,
+		reaction.Target.AuthorServiceID,
+		reaction.Target.AuthorUUID,
+		reaction.Target.Author,
+		reaction.TargetAuthorNumber,
+		reaction.TargetAuthorACI,
+		reaction.TargetAuthorServiceID,
+		reaction.TargetAuthorUUID,
+		reaction.TargetAuthor,
+		account,
+	)
+}
+
+// ReactionTargetAuthor applies the retained nested/legacy reaction target
+// precedence without duplicating it in the durable decoder.
+func ReactionTargetAuthor(reaction *Reaction, account string) string {
+	return signalReactionTargetAuthor(reaction, account)
+}
+
+func signalReactionTargetTimestamp(reaction *signalReaction) int64 {
+	if reaction == nil {
+		return 0
+	}
+	if reaction.TargetSentTimestamp != 0 {
+		return reaction.TargetSentTimestamp
+	}
+	return reaction.Target.Timestamp
+}
+
+// ReactionTargetTimestamp applies the retained reaction timestamp fallback.
+func ReactionTargetTimestamp(reaction *Reaction) int64 {
+	return signalReactionTargetTimestamp(reaction)
+}
+
+func signalEnvelopeSource(env *signalEnvelope) string {
+	if env == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		strings.TrimSpace(env.SourceNumber),
+		strings.TrimSpace(env.SourceServiceID),
+		strings.TrimSpace(env.SourceUUID),
+		strings.TrimSpace(env.Source),
+	)
+}
+
+// EnvelopeSource applies the retained E.164/service-id source precedence.
+func EnvelopeSource(env *Envelope) string {
+	return signalEnvelopeSource(env)
+}
+
+func signalSentTarget(sent *signalSentMessage) string {
+	if sent == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		strings.TrimSpace(sent.DestinationNumber),
+		strings.TrimSpace(sent.DestinationE164),
+		strings.TrimSpace(sent.DestinationUUID),
+		strings.TrimSpace(sent.DestinationServiceID),
+		strings.TrimSpace(sent.Destination),
+	)
+}
+
+// SentTarget applies the retained destination precedence for sync transcripts.
+func SentTarget(sent *SentMessage) string {
+	return signalSentTarget(sent)
+}
+
+func signalEditGroupInfo(edit *signalEditMessage) *signalGroupInfo {
+	if edit == nil || edit.DataMessage == nil {
+		return nil
+	}
+	return edit.DataMessage.GroupInfo
+}
+
+func signalSentGroupInfo(sent *signalSentMessage) *signalGroupInfo {
+	if sent == nil {
+		return nil
+	}
+	if sent.GroupInfo != nil {
+		return sent.GroupInfo
+	}
+	return signalEditGroupInfo(sent.EditMessage)
+}
+
+func signalGroupTitle(info *signalGroupInfo) string {
+	if info == nil {
+		return ""
+	}
+	return firstNonEmpty(strings.TrimSpace(info.GroupName), strings.TrimSpace(info.Title))
+}
+
+func signalReactionStoreEmoji(emoji, action string) string {
+	if strings.EqualFold(strings.TrimSpace(action), "remove") {
+		return ""
+	}
+	return strings.TrimSpace(emoji)
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+const (
+	signalUnsupportedMessagePlaceholder = "[Unsupported Signal message]"
+	signalMissingEditSourcePrefix       = "missing-edit:"
+)
+
+type signalUnsupportedContentFlags struct {
+	IsExpirationUpdate bool
+	ViewOnce           bool
+	HasPayment         bool
+	HasPreview         bool
+	HasSticker         bool
+	HasRemoteDelete    bool
+	HasContacts        bool
+	HasPollCreate      bool
+	HasPollVote        bool
+	HasPollTerminate   bool
+	HasStoryContext    bool
+	HasPinMessage      bool
+	HasUnpinMessage    bool
+	HasAdminDelete     bool
+	HasGroupUpdate     bool
+}
+
+func (m *signalDataMessage) displayBody() string {
+	if m == nil {
+		return signalUnsupportedMessagePlaceholder
+	}
+	body := strings.TrimSpace(m.Message)
+	if body != "" {
+		return body
+	}
+	return signalUnsupportedContentPlaceholder(m.Attachments, signalUnsupportedContentFlags{
+		IsExpirationUpdate: m.IsExpirationUpdate,
+		ViewOnce:           m.ViewOnce,
+		HasPayment:         signalRawMessagePresent(m.Payment),
+		HasPreview:         len(m.Previews) > 0,
+		HasSticker:         signalRawMessagePresent(m.Sticker),
+		HasRemoteDelete:    signalRawMessagePresent(m.RemoteDelete),
+		HasContacts:        len(m.Contacts) > 0,
+		HasPollCreate:      signalRawMessagePresent(m.PollCreate),
+		HasPollVote:        signalRawMessagePresent(m.PollVote),
+		HasPollTerminate:   signalRawMessagePresent(m.PollTerminate),
+		HasStoryContext:    signalRawMessagePresent(m.StoryContext),
+		HasPinMessage:      signalRawMessagePresent(m.PinMessage),
+		HasUnpinMessage:    signalRawMessagePresent(m.UnpinMessage),
+		HasAdminDelete:     signalRawMessagePresent(m.AdminDelete),
+		HasGroupUpdate:     signalIsGroupUpdate(m.GroupInfo),
+	})
+}
+
+// DisplayBody applies the retained visible-body/placeholder semantics.
+func (m *signalDataMessage) DisplayBody() string {
+	return m.displayBody()
+}
+
+func (m *signalSentMessage) displayBody() string {
+	if m == nil {
+		return signalUnsupportedMessagePlaceholder
+	}
+	body := strings.TrimSpace(m.Message)
+	if body != "" {
+		return body
+	}
+	return signalUnsupportedContentPlaceholder(m.Attachments, signalUnsupportedContentFlags{
+		IsExpirationUpdate: m.IsExpirationUpdate,
+		ViewOnce:           m.ViewOnce,
+		HasPayment:         signalRawMessagePresent(m.Payment),
+		HasPreview:         len(m.Previews) > 0,
+		HasSticker:         signalRawMessagePresent(m.Sticker),
+		HasRemoteDelete:    signalRawMessagePresent(m.RemoteDelete),
+		HasContacts:        len(m.Contacts) > 0,
+		HasPollCreate:      signalRawMessagePresent(m.PollCreate),
+		HasPollVote:        signalRawMessagePresent(m.PollVote),
+		HasPollTerminate:   signalRawMessagePresent(m.PollTerminate),
+		HasStoryContext:    signalRawMessagePresent(m.StoryContext),
+		HasPinMessage:      signalRawMessagePresent(m.PinMessage),
+		HasUnpinMessage:    signalRawMessagePresent(m.UnpinMessage),
+		HasAdminDelete:     signalRawMessagePresent(m.AdminDelete),
+		HasGroupUpdate:     signalIsGroupUpdate(m.GroupInfo),
+	})
+}
+
+// DisplayBody applies the retained sent-message body/placeholder semantics.
+func (m *signalSentMessage) DisplayBody() string {
+	return m.displayBody()
+}
+
+func signalUnsupportedContentPlaceholder(attachments []signalAttachment, flags signalUnsupportedContentFlags) string {
+	if body := signalAttachmentPlaceholder(attachments); body != "" {
+		return body
+	}
+	switch {
+	case flags.HasSticker:
+		return "[Sticker]"
+	case flags.HasContacts:
+		return "[Contact]"
+	case flags.HasPayment:
+		return "[Payment]"
+	case flags.HasPollCreate:
+		return "[Poll]"
+	case flags.HasPollVote:
+		return "[Poll vote]"
+	case flags.HasPollTerminate:
+		return "[Poll closed]"
+	case flags.HasRemoteDelete:
+		return "[Deleted message]"
+	case flags.HasPinMessage:
+		return "[Pinned message]"
+	case flags.HasUnpinMessage:
+		return "[Unpinned message]"
+	case flags.HasAdminDelete:
+		return "[Deleted by admin]"
+	case flags.HasGroupUpdate:
+		return "[Group updated]"
+	case flags.HasStoryContext:
+		return "[Story reply]"
+	case flags.IsExpirationUpdate:
+		return "[Disappearing messages updated]"
+	case flags.ViewOnce:
+		return "[View-once message]"
+	case flags.HasPreview:
+		return "[Link preview]"
+	default:
+		return signalUnsupportedMessagePlaceholder
+	}
+}
+
+func signalRawMessagePresent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func signalIsGroupUpdate(info *signalGroupInfo) bool {
+	return info != nil && strings.EqualFold(strings.TrimSpace(info.Type), "UPDATE")
+}
+
+func signalAttachmentPlaceholder(attachments []signalAttachment) string {
+	if len(attachments) == 0 {
+		return ""
+	}
+	mime := strings.ToLower(strings.TrimSpace(attachments[0].ContentType))
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "[Photo]"
+	case strings.HasPrefix(mime, "video/"):
+		return "[Video]"
+	case strings.HasPrefix(mime, "audio/"):
+		return "[Audio]"
+	default:
+		return "[Attachment]"
+	}
+}
+
+const signalAttachmentPrefix = "signalatt:"
+const signalLocalAttachmentPrefix = "signallocal:"
+
+func encodeSignalAttachmentRef(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return signalAttachmentPrefix + id
+}
+
+func encodeSignalLocalAttachmentRef(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return signalLocalAttachmentPrefix + base64.RawURLEncoding.EncodeToString([]byte(path))
+}
+
+func decodeSignalAttachmentRef(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, signalAttachmentPrefix) {
+		return "", errors.New("invalid Signal attachment reference")
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(value, signalAttachmentPrefix))
+	if id == "" {
+		return "", errors.New("empty Signal attachment reference")
+	}
+	return id, nil
+}
+
+func decodeSignalLocalAttachmentRef(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, signalLocalAttachmentPrefix) {
+		return "", errors.New("invalid Signal local attachment reference")
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(value, signalLocalAttachmentPrefix))
+	if raw == "" {
+		return "", errors.New("empty Signal local attachment reference")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", fmt.Errorf("decode Signal local attachment reference: %w", err)
+	}
+	path := strings.TrimSpace(string(decoded))
+	if path == "" {
+		return "", errors.New("empty Signal local attachment path")
+	}
+	return path, nil
+}
+
+func (b *Bridge) DownloadMedia(msg *db.Message) ([]byte, string, error) {
+	if msg == nil {
+		return nil, "", errors.New("signal media message is required")
+	}
+	if localPath, err := decodeSignalLocalAttachmentRef(msg.MediaID); err == nil {
+		data, readErr := os.ReadFile(localPath)
+		if readErr != nil {
+			return nil, "", fmt.Errorf("read local Signal attachment: %w", readErr)
+		}
+		mimeType := strings.TrimSpace(msg.MimeType)
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		return data, mimeType, nil
+	}
+	attachmentID, err := decodeSignalAttachmentRef(msg.MediaID)
+	if err != nil {
+		return nil, "", err
+	}
+	account, err := b.usableAccount()
+	if err != nil {
+		return nil, "", err
+	}
+	target, isGroup, err := parseConversationTarget(msg.ConversationID)
+	if err != nil {
+		return nil, "", err
+	}
+	data, err := b.downloadSignalAttachment(account, attachmentID, target, isGroup)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, msg.MimeType, nil
+}
+
+// DownloadMediaRef is the store-free retained entry point used by the M4b
+// lifecycle adapter. Signal's transport reports no MIME, so the adapter falls
+// back to bridge.MediaRef.MIME after this returns an empty MIME string.
+func (b *Bridge) DownloadMediaRef(
+	account, kind, attachmentID, path, target string,
+	isGroup bool,
+) ([]byte, string, error) {
+	switch strings.TrimSpace(kind) {
+	case "local":
+		if strings.TrimSpace(path) == "" {
+			return nil, "", errors.New("Signal local attachment path is required")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("read local Signal attachment: %w", err)
+		}
+		return data, "", nil
+	case "remote":
+		account = strings.TrimSpace(account)
+		attachmentID = strings.TrimSpace(attachmentID)
+		target = strings.TrimSpace(target)
+		if account == "" || attachmentID == "" || target == "" {
+			return nil, "", errors.New("Signal remote attachment account, id, and target are required")
+		}
+		data, err := b.downloadSignalAttachment(account, attachmentID, target, isGroup)
+		if err != nil {
+			return nil, "", err
+		}
+		return data, "", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported Signal attachment kind %q", kind)
+	}
+}
+
+// downloadSignalAttachment is the store-free signal-cli getAttachment core
+// shared by the legacy db.Message downloader and the ref-shaped M4b path.
+func (b *Bridge) downloadSignalAttachment(
+	account, attachmentID, target string,
+	isGroup bool,
+) ([]byte, error) {
+	args := []string{"-a", account, "getAttachment", "--id", attachmentID}
+	if isGroup {
+		args = append(args, "--group-id", target)
+	} else {
+		args = append(args, "--recipient", target)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	if err != nil {
+		return nil, commandError("download Signal attachment", err, output)
+	}
+	payload := strings.TrimSpace(string(output))
+	if payload == "" {
+		return nil, errors.New("signal attachment is empty")
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(payload)
+		if err != nil {
+			return nil, fmt.Errorf("decode Signal attachment: %w", err)
+		}
+	}
+	return data, nil
+}
+
+func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
+	replyToID = strings.TrimSpace(replyToID)
+	if replyToID == "" {
+		return nil, nil
+	}
+	if b == nil || b.store == nil {
+		return nil, nil
+	}
+	target, err := b.store.GetMessageByID(replyToID)
+	if err != nil {
+		return nil, fmt.Errorf("load Signal reply target: %w", err)
+	}
+	if target == nil || target.SourcePlatform != "signal" {
+		return nil, errors.New("signal reply target not found")
+	}
+	if target.TimestampMS == 0 {
+		return nil, errors.New("signal reply target timestamp is unavailable")
+	}
+	author := normalizeSignalAddress(target.SenderNumber)
+	if target.IsFromMe || addressesMatch(author, account) || author == "" {
+		author = account
+	} else {
+		author = b.resolveContactAddress(author)
+	}
+	if author == "" {
+		return nil, errors.New("signal reply target author is unavailable")
+	}
+	quoteBody := strings.TrimSpace(target.Body)
+	if quoteBody == "" && target.MediaID != "" {
+		quoteBody = signalAttachmentPlaceholder([]signalAttachment{{ContentType: target.MimeType}})
+	}
+	if quoteBody == "" {
+		quoteBody = "Attachment"
+	}
+	return []string{
+		"--quote-timestamp", strconv.FormatInt(target.TimestampMS, 10),
+		"--quote-author", author,
+		"--quote-message", quoteBody,
+	}, nil
+}
+
+func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, error) {
+	return b.writeLocalAttachmentReader(bytes.NewReader(data), int64(len(data)), filename)
+}
+
+func (b *Bridge) writeLocalAttachmentReader(content io.Reader, size int64, filename string) (string, error) {
+	if content == nil {
+		return "", errors.New("Signal attachment reader is required")
+	}
+	if size <= 0 {
+		return "", errors.New("Signal attachment size must be positive")
+	}
+	cacheDir := filepath.Join(b.configDir, "outgoing-attachments")
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		return "", fmt.Errorf("create Signal attachment cache: %w", err)
+	}
+	pattern := "signal-*"
+	if ext := strings.TrimSpace(filepath.Ext(filename)); ext != "" {
+		pattern += ext
+	}
+	file, err := os.CreateTemp(cacheDir, pattern)
+	if err != nil {
+		return "", fmt.Errorf("create Signal attachment temp file: %w", err)
+	}
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = os.Remove(file.Name())
+		}
+	}()
+	written, err := io.Copy(file, io.LimitReader(content, size+1))
+	if err != nil {
+		return "", fmt.Errorf("write Signal attachment temp file: %w", err)
+	}
+	if written > size {
+		return "", fmt.Errorf("Signal attachment exceeds declared size %d", size)
+	}
+	if written < size {
+		return "", fmt.Errorf("Signal attachment ended at %d bytes; expected %d", written, size)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(file.Name())
+		return "", fmt.Errorf("close Signal attachment temp file: %w", err)
+	}
+	remove = false
+	return file.Name(), nil
+}
+
+func cleanupLocalSignalAttachment(mediaID string) {
+	path, err := decodeSignalLocalAttachmentRef(mediaID)
+	if err != nil || path == "" {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+func sanitizeSignalOutput(line string) string {
+	line = strings.ReplaceAll(line, "\r", "")
+	for {
+		start := strings.Index(line, "\x1b")
+		if start == -1 {
+			return strings.TrimSpace(line)
+		}
+		end := start + 1
+		for end < len(line) {
+			ch := line[end]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') {
+				end++
+				break
+			}
+			end++
+		}
+		line = line[:start] + line[end:]
+	}
+}
+
+func extractSignalLinkURI(line string) string {
+	idx := strings.Index(line, "sgnl://linkdevice?")
+	if idx == -1 {
+		return ""
+	}
+	return strings.TrimSpace(line[idx:])
+}
+
+// CommandError identifies a signal-cli subprocess failure. App-level send
+// wrappers use this marker to notify the lifecycle owner without turning local
+// validation, file, or database errors into reconnects.
+type CommandError struct {
+	message string
+}
+
+func (e *CommandError) Error() string { return e.message }
+
+func commandError(prefix string, err error, output []byte) error {
+	return &CommandError{message: fmt.Sprintf("%s: %s", prefix, cleanSignalCommandOutput(err, output))}
+}
+
+type signalSendNotDispatchedError struct {
+	err error
+}
+
+func (e *signalSendNotDispatchedError) Error() string { return e.err.Error() }
+
+func (e *signalSendNotDispatchedError) Unwrap() error { return e.err }
+
+func (*signalSendNotDispatchedError) SignalSendNotDispatched() {}
+
+func commandNotDispatchedError(prefix string, err error, output []byte) error {
+	return &signalSendNotDispatchedError{err: commandError(prefix, err, output)}
+}
+
+// NewCommandError builds a signal-cli command-failure marker carrying message as
+// its text. Production send paths use the internal commandError constructor;
+// this exported form lets callers and tests synthesize the exact marker that App
+// send wrappers hand to the lifecycle owner via ReportError.
+func NewCommandError(message string) *CommandError {
+	return &CommandError{message: message}
+}
+
+func IsCommandError(err error) bool {
+	var commandErr *CommandError
+	return errors.As(err, &commandErr)
+}
+
+// IsSendNotDispatchedError reports whether a complete signal-cli result proves
+// that every recipient failed before any message was dispatched. The marker is
+// deliberately narrower than CommandError: mixed recipient results, malformed
+// output, and timeouts remain uncertain.
+func IsSendNotDispatchedError(err error) bool {
+	var marker interface{ SignalSendNotDispatched() }
+	return errors.As(err, &marker)
+}
+
+func IsAccountInvalidError(err error) bool {
+	return isSignalAccountInvalid(err, nil)
+}
+
+// IsSendAccountInvalidError reports whether a signal-cli *send* failure
+// unambiguously indicts the local account's own credentials rather than the
+// message recipient. signal-cli reports an unregistered recipient with the same
+// "not registered" phrasing it uses for an unregistered local account, so send
+// paths must NOT treat that phrase as a local-account fault: the account-scoped
+// receive probe (probe_account -> PollerFailureReauth) is the authoritative
+// detector and — after its in-generation retries and accounts.json
+// corroboration — still parks a genuinely missing account within seconds.
+// "authorization failed" and "invalid account" name the local
+// account/credentials and never a recipient, so they stay safe to act on from
+// a send. See isSignalAccountInvalid for the broader receive/probe matcher
+// that also accepts "not registered".
+func IsSendAccountInvalidError(err error) bool {
+	return isSignalSendAccountInvalid(err, nil)
+}
+
+func cleanSignalCommandOutput(err error, output []byte) string {
+	lines := []string{}
+	if err != nil {
+		lines = append(lines, strings.TrimSpace(err.Error()))
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = sanitizeSignalOutput(line)
+		if line == "" || strings.HasPrefix(line, "████") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.TrimSpace(strings.Join(uniqueStrings(lines), ": "))
+}
+
+func isSignalAccountInvalid(err error, output []byte) bool {
+	text := strings.ToLower(cleanSignalCommandOutput(err, output))
+	return strings.Contains(text, "not registered") ||
+		strings.Contains(text, "authorization failed") ||
+		strings.Contains(text, "invalid account")
+}
+
+// isSignalSendAccountInvalid is the send-context subset of isSignalAccountInvalid:
+// it matches only the phrases that unambiguously indict the local account and
+// omits "not registered", which a send commonly reports for an unregistered
+// *recipient*. Keep this list a strict subset of isSignalAccountInvalid.
+func isSignalSendAccountInvalid(err error, output []byte) bool {
+	text := strings.ToLower(cleanSignalCommandOutput(err, output))
+	return strings.Contains(text, "authorization failed") ||
+		strings.Contains(text, "invalid account")
+}
+
+func signalReceivePoisonFingerprint(err error, output []byte) string {
+	text := strings.ToLower(cleanSignalCommandOutput(err, output))
+	text = strings.NewReplacer(`"`, "", `'`, "").Replace(text)
+	if strings.Contains(text, "getsender") &&
+		strings.Contains(text, "content is null") {
+		return signalGetSenderPoisonFingerprint
+	}
+	return ""
+}
+
+func uniqueStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func marshalParticipants(items []participantJSON) (string, error) {
+	data, err := json.Marshal(items)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func addressesMatch(a, b string) bool {
+	a = normalizeSignalAddress(a)
+	b = normalizeSignalAddress(b)
+	return a != "" && b != "" && strings.EqualFold(a, b)
+}
+
+// AddressesMatch exposes the retained Signal address comparison to the pure
+// durable decoder.
+func AddressesMatch(a, b string) bool {
+	return addressesMatch(a, b)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}

@@ -1,0 +1,281 @@
+# OpenMessage
+
+Local-first universal message database with built-in MCP server. Ingests messages from SMS/RCS (Google Messages), Google Chat, iMessage, and WhatsApp.
+
+## Architecture
+
+```
+├── cmd/              Go CLI commands (pair, serve, send, read, status, import)
+├── internal/
+│   ├── app/          Bootstrap, data dir, backfill
+│   ├── client/       libgm Google Messages protocol
+│   ├── db/           SQLite store (conversations, messages, contacts, unified_contacts, drafts)
+│   ├── importer/     Multi-platform import adapters (gchat, imessage, whatsapp)
+│   ├── story/        Stats computation + narrative story generation
+│   ├── tools/        MCP tools (24 tools)
+│   ├── viz/          Relationship visualization renderer (self-contained HTML)
+│   └── web/          HTTP API + embedded React UI
+├── macos/            Swift macOS app wrapper
+│   ├── OpenMessage/  Swift package (BackendManager, PairingView, etc.)
+│   └── build.sh      Builds universal binary + .app + .dmg
+├── site/             Static website (deployed to openmessage.ai)
+└── vercel.json       Vercel config (root — NOT site/vercel.json)
+```
+
+## Supporting a live install (READ FIRST for support/debug tasks)
+
+If you are debugging a real user's install — sends failing, re-pairing, reading
+their actual messages — read **[docs/agent-runbook.md](docs/agent-runbook.md)**
+before touching anything. The traps that cost the most:
+
+- **Two data dirs, not one.** The macOS app's live store is
+  `~/Library/Application Support/OpenMessage/` (set via `OPENMESSAGES_DATA_DIR`).
+  The CLI default (`~/.local/share/openmessage/`) is a **separate, usually
+  stale** store. Point CLI tools at the app dir for live data.
+- **Read live messages via the HTTP API** (`/api/conversations/<id>/messages`,
+  `/api/search`, `/api/status`) — the app holds the WAL'd DB, so a direct
+  `sqlite3` reader hits "unable to open database file (14)".
+- **Re-pairing Google Messages:** QR is dead; use Google Account pairing via the
+  cookie method; clear `session.json` from **both** data dirs to reach the
+  pairing screen; don't over-reconnect (it throttles the account). Full recipe
+  in the runbook.
+
+## Local CLI (read-only, no transports)
+
+These commands open the store directly (repair-free, via `app.NewClient` — no
+startup repair writes to the shared live store) and start no live transports,
+so they work in a one-shot terminal session without pairing or Full Disk
+Access:
+
+```bash
+openmessage read "<query>" [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]
+openmessage search ...                                            # alias for read
+openmessage status [--json]                                       # per-platform counts + sync freshness
+```
+
+`status` is the fast way to check coverage before trusting a search: it lists
+each platform's message count and latest sent/received timestamps, and flags a
+platform that has stopped syncing in the AGE column. "Nd behind": its latest
+message trails the newest overall by ≥3 days. "silent Nh": its transport has
+delivered nothing for N hours, longer than its own baseline explains. That is
+the `internal/freshness` silence rule behind `/api/status`
+`freshness.<platform>.silence`, and it also catches a stall of the newest
+platform, which the relative rule never can (Google, 2026-10-06). When the
+running app serves the same data dir and reports a verdict measured on the
+source this command reads, `status` shows the app's (daemon truth, as for
+sends). Otherwise it judges locally with `freshness.EvaluateSilence` on the
+source the daemon would read: the v2 inbox when reads come from the v2 store,
+the legacy store's incoming messages otherwise. It reuses the stores it already
+opened. The text under the table says who judged and why (the app isn't
+running or didn't answer within 3s, serves another data dir, predates the
+check, or measures v2 while the CLI reads legacy), and names any verdict
+judged without a baseline (only the 72h floor applies) or platform with no
+recorded activity. `--json` adds each row's `behind_days`, `silence` (the
+daemon's field names, built by `freshness.SilenceBlock`) and
+`silence_judged_by` (`daemon` | `local`), plus `silence_note`. sms and rcs rows
+both carry Google's verdict. A stale row means the daemon isn't syncing that
+platform, or the phone behind it has stopped delivering; searches over that
+window will miss messages.
+
+"Read-only" here means no startup repair sweeps (`repairStartupArtifacts`) and
+no transports. Opening a store still writes: `sqlite.Open` (v2) applies any
+pending migrations and writes nothing when the store is current; `db.New`
+(legacy) runs `migrate()` on every open, which drops and recreates three
+`contact_avatars` indexes, keeps one row of each group of Signal rows that
+share a conversation, sender and timestamp and deletes the rest, and
+repopulates the FTS index when its row count differs from `messages`. Keeping
+the CLI binary in step with the app avoids the v2 migrations, not the legacy
+writes.
+
+`read` resolves each hit's sender (name → number → conversation id) so results
+are legible without a second lookup, and accepts
+`--since`/`--until` (YYYY-MM-DD, local time; `--until` is inclusive to end of
+day) to scope a search to a date window. Date filtering lives in the store via
+`SearchFilter`/`SearchMessagesFiltered`; the legacy `SearchMessages(query,
+phone, limit)` wrapper is preserved for the MCP tool and HTTP API.
+
+## Multi-platform import
+
+```bash
+openmessage import gchat /path/to/Takeout/Google\ Chat/Groups/ --email you@gmail.com
+openmessage import gchat-conversation /path/to/messages.json --email you@gmail.com
+openmessage import imessage                     # reads ~/Library/Messages/chat.db (needs Full Disk Access)
+openmessage import whatsapp /path/to/chat.txt --name "Your Name"
+```
+
+### MCP serving modes
+
+`serve --mcp-stdio` (the shape MCP hosts spawn per session) runs as a
+**transportless client**: it starts zero transport supervisors, dispatchers,
+sync loops, or schedulers — the app daemon owns all live connections (two
+processes sharing WhatsApp/signal-cli credentials log each other out). Reads
+come from the local store (v2 when the daemon reports v2-primary for the same
+data dir); sends, reactions, and `get_status` route through the running
+daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+The client opens the store via `app.NewClient`, which skips the startup repair
+sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
+repair writes into the live `messages.db`.
+`--transports` / `--no-transports` override the default per shape. See
+[docs/agent-runbook.md](docs/agent-runbook.md) ("MCP serving") for the failure
+mode this prevents and the `~/.mcp.json` recipe.
+
+### MCP tools
+
+24 tools registered (see internal/tools/tools.go Register for the authoritative list):
+- `get_messages`, `get_conversation`, `search_messages` — cross-platform by default
+- `list_conversations` — optional `source_platform` filter (sms, gchat, imessage, whatsapp)
+- `get_person_messages` — all messages with a person across all platforms
+- `get_person_messages_range` — date-filtered version of get_person_messages (for deep-diving into specific periods)
+- `import_messages` — import from any supported source
+- `conversation_stats` — volume, heatmap, phrases, response times, gaps (single conversation)
+- `generate_story` — narrative chapters with optional Claude API enhancement (single conversation)
+- `person_stats` — cross-platform stats for all 1:1 messages with a person (merges + deduplicates)
+- `generate_person_story` — cross-platform narrative story for a person (merges + deduplicates)
+- `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
+- `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
+- `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+
+Optional API story generation uses `claude-sonnet-5-5` with medium effort and
+a 16,000-token limit when the caller supplies an Anthropic API key. Without a
+key, or if the API fails or refuses the request, it generates a local
+stats-and-quotes story. There is no environment override for the model.
+
+On a v2-primary install the message-read tools (including `get_person_messages`
+and `get_person_messages_range`) serve the v2 store through the canonical read
+seam; on v2 their `limit` is capped (500 and 2,000, and the output says when
+the cap applied) because the v2 batch path fans out per matching conversation,
+while the legacy single-query path keeps the caller's value above a floor of 1
+(a negative SQLite LIMIT means no limit). Date arguments are YYYY-MM-DD in
+local time on every surface (CLI, HTTP, MCP) via `db.ParseDayBound`, and the
+range tool labels rows in that same local time. The stats/story/viz tools
+(`conversation_stats`, `generate_story`,
+`person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
+load full histories from the legacy store, which froze at cutover, so they
+return an error naming the working read tools instead.
+
+### HTTP API
+
+- `GET /api/stats/{conversation_id}` — conversation statistics JSON
+- `GET /api/story/{conversation_id}?style=intimate&api_key=...` — generated story JSON
+- `GET /api/conversations?limit=50` — list all conversations (all platforms)
+- `GET /api/search?q=...` — **conversation-level** search: one row per matching
+  conversation (`ConversationID`/`Name`/`Participants`/`preview`), matched by
+  message text and by conversation name/participants. This feeds the web UI's
+  search box — it does not return message rows.
+- `GET /api/search/messages?q=...` — **message-level** search: raw message DTOs
+  (`MessageID`/`Body`/`TimestampMS`…, same shape as
+  `/api/conversations/<id>/messages`), the HTTP twin of the `search_messages`
+  MCP tool. Optional `phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD,
+  local time, `until` inclusive to end of day), `limit` (default 50, max 500).
+
+### Schema
+
+Messages and conversations have `source_platform` (sms/gchat/imessage/whatsapp/signal/telegram) and messages have `source_id` for dedup. Unified contacts table maps people across platforms.
+
+## Vercel deployment (openmessage.ai)
+
+**CRITICAL: Always deploy from the repo root**, not from `~` or any other directory. The `.vercel/project.json` links to the correct project/scope.
+
+**Config lives at root `vercel.json`**, not `site/vercel.json`. The root config sets `outputDirectory: "site"` and `cleanUrls: true`. A `.vercelignore` excludes Go/Swift build artifacts.
+
+**Scope: `max-ghenis-projects`** (personal account, NOT PolicyEngine).
+
+Deploy:
+```bash
+cd /Users/maxghenis/openmessages && vercel --prod
+```
+
+**Always verify after deploy:**
+```bash
+curl -s -o /dev/null -w "%{http_code}" https://openmessage.ai
+```
+
+**Domains:** `openmessage.ai` (primary) and `openmessages.ai` (alias), both on Cloudflare DNS → 76.76.21.21.
+
+## Building the macOS app
+
+```bash
+./macos/build.sh
+```
+
+This builds: Go universal binary (arm64+amd64) → Swift app → .app bundle → .dmg
+
+**Dev builds get a distinct bundle identity.** Plain `./macos/build.sh` stamps
+`com.openmessage.app.dev`, names the bundle `OpenMessage (dev)`, and emits
+`OpenMessage-dev.dmg`, so a stale build can never shadow the installed app in
+LaunchServices — by id or by name (this caused two live outages —
+see [docs/agent-runbook.md](docs/agent-runbook.md) "Bundle-id shadowing").
+Anything installable or shippable **must** set `RELEASE=1`:
+
+```bash
+RELEASE=1 ./macos/build.sh
+```
+
+Building from a nested `.claude/worktrees/*` checkout also needs `GOWORK=off`
+(Go otherwise finds `~/openmessage/go.work` and resolves the main module to the
+parent).
+
+To install locally (requires `RELEASE=1` above):
+```bash
+cp -R macos/build/OpenMessage.app /Applications/ && xattr -cr /Applications/OpenMessage.app
+```
+
+To update the GitHub release:
+```bash
+gh release upload v0.1.0 macos/build/OpenMessage.dmg --repo MaxGhenis/openmessage --clobber
+```
+
+## Testing
+
+```bash
+go test ./cmd/ -v      # Unit + integration tests
+go test ./... -v       # All tests
+```
+
+## Relationship visualization (`generate_viz`)
+
+Generates a self-contained HTML file combining data dashboards with narrative chapters. Output is deployable to Vercel or viewable locally.
+
+**Sections**: password gate, hero, timeline nav, narrative chapters (early/middle/late), monthly volume chart (Chart.js), sender split donut, response times, hour-of-week heatmap, phrase cloud (colored by sender ratio), longest gap callout, interspersed photo breaks (chronologically aligned), interludes, closing.
+
+**Key parameters**: `name` (person to search), `output_path` (relative to `OPENMESSAGES_EXPORT_DIR`, default `~/Documents/OpenMessage`, unless `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1` is set), `timezone` (default ET), `password`, `api_key` (for Claude-generated narrative), colors (`primary_color`, `secondary_color`, etc.).
+
+**Architecture**:
+- `internal/viz/config.go` — `VizConfig` struct, section ordering, color theming
+- `internal/viz/render.go` — `RenderHTML()` orchestrator, Chart.js data building
+- `internal/viz/template.go` — Go html/template with all CSS/JS inline (except CDN fonts + Chart.js)
+- `internal/viz/photos.go` — `Photo` struct, `EncodePhotosFromDir/Paths()`, date parsing from filenames, chronological sorting
+- `internal/tools/viz.go` — MCP tool handler
+
+**Stats engine extensions** (`internal/story/stats.go`):
+- `PhraseCount.BySender` — per-sender phrase counts for colored word cloud
+- `ComputeStats(messages, tz)` — timezone parameter for TZ-shifted heatmap
+
+## Agentic story generation (`/generate-story`)
+
+Claude Code slash command that produces fact-grounded relationship visualizations. Instead of a single-pass API call that halluculates, the agent explores conversations agentically:
+
+1. `person_stats` → identify 4-8 pivotal periods from volume patterns
+2. `get_person_messages_range` → deep-dive into each period's actual messages
+2.5. Photo curation → visually inspect candidate photos, select best 15-25
+3. Write chapters grounded in real quotes and events
+4. `render_story` → combine narrative with data dashboards into HTML
+
+**Usage:** `/generate-story Jenn` from Claude Code in this project.
+
+**Key tools:**
+- `get_person_messages_range` — date-filtered cross-platform messages for deep-dives
+- `render_story` — accepts pre-built Story JSON + person name, computes stats, renders HTML
+
+**Command file:** `.claude/commands/generate-story.md`
+
+## Key files
+
+- `internal/app/app.go` — data dir resolution (`OPENMESSAGES_DATA_DIR` env var; CLI default is `~/.local/share/openmessage`, but **the macOS app overrides it to `~/Library/Application Support/OpenMessage`** — see [docs/agent-runbook.md](docs/agent-runbook.md))
+- `internal/db/db.go` — schema, structs, migration
+- `internal/importer/` — gchat.go, imessage.go, whatsapp.go
+- `internal/story/stats.go` — conversation statistics computation (with timezone + per-sender phrases)
+- `internal/story/generate.go` — narrative story generation (local or Claude API)
+- `internal/viz/` — relationship visualization renderer (config, template, render, photos)
+- `internal/client/events.go` — handles Google Messages protocol events
+- `macos/OpenMessage/Sources/BackendManager.swift` — launches Go backend, manages app state

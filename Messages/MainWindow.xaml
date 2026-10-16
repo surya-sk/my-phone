@@ -1,0 +1,634 @@
+<Window x:Class="Messages.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:models="using:Messages.Models"
+    xmlns:controls="using:Messages.Controls"
+    Title="My Phone">
+    <Window.SystemBackdrop><MicaBackdrop /></Window.SystemBackdrop>
+
+    <Grid x:Name="Root" Background="Transparent" KeyDown="Root_KeyDown">
+        <Grid.Resources>
+            <!-- ===== Inbox rows ===== -->
+            <DataTemplate x:Key="ConversationTemplate" x:DataType="models:ConversationItem">
+                <Grid Height="76" Padding="24,0,20,0" ColumnSpacing="14" Background="Transparent"
+                      ContextRequested="Conversation_ContextRequested"
+                      AutomationProperties.Name="{x:Bind AutomationName, Mode=OneWay}">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="52" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Grid Width="52" Height="52" Background="{x:Bind TileBrush, Mode=OneWay}">
+                        <TextBlock Text="{x:Bind Initials, Mode=OneWay}" FontFamily="{StaticResource MetroDisplayFont}"
+                                   FontSize="21" FontWeight="Light" Foreground="White"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <FontIcon Glyph="{x:Bind TileGlyph, Mode=OneWay}" FontSize="22" Foreground="White"
+                                  Visibility="{x:Bind GroupGlyphVisibility, Mode=OneWay}" />
+                        <Image Source="{x:Bind Avatar, Mode=OneWay}" Stretch="UniformToFill"
+                               Visibility="{x:Bind AvatarVisibility, Mode=OneWay}" />
+                    </Grid>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="1">
+                        <TextBlock Text="{x:Bind Title, Mode=OneWay}" FontSize="17" FontWeight="{x:Bind TitleWeight, Mode=OneWay}"
+                                   TextTrimming="CharacterEllipsis" MaxLines="1" />
+                        <TextBlock Text="{x:Bind Preview, Mode=OneWay}" FontSize="13.5" Opacity="{x:Bind PreviewOpacity, Mode=OneWay}"
+                                   TextTrimming="CharacterEllipsis" MaxLines="1" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" VerticalAlignment="Center" Spacing="7">
+                        <StackPanel Orientation="Horizontal" Spacing="6" HorizontalAlignment="Right">
+                            <FontIcon Glyph="&#xE718;" FontSize="11" Opacity="0.6" Visibility="{x:Bind PinVisibility, Mode=OneWay}" />
+                            <FontIcon Glyph="&#xE7ED;" FontSize="11" Opacity="0.6" Visibility="{x:Bind MuteVisibility, Mode=OneWay}" />
+                            <TextBlock Text="{x:Bind TimeText, Mode=OneWay}" FontSize="12" Opacity="0.6" />
+                        </StackPanel>
+                        <Border HorizontalAlignment="Right" Background="{ThemeResource MetroAccentBrush}" MinWidth="22" Height="22"
+                                Padding="6,0" Visibility="{x:Bind UnreadVisibility, Mode=OneWay}">
+                            <TextBlock Text="{x:Bind UnreadText, Mode=OneWay}" Foreground="White" FontSize="12" FontWeight="SemiBold"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                    </StackPanel>
+                </Grid>
+            </DataTemplate>
+
+            <DataTemplate x:Key="SectionHeaderTemplate" x:DataType="models:SectionHeaderItem">
+                <TextBlock Text="{x:Bind Text}" Margin="24,18,0,6" FontFamily="{StaticResource MetroDisplayFont}"
+                           FontSize="20" FontWeight="Light" Foreground="{ThemeResource MetroAccentTextBrush}" />
+            </DataTemplate>
+
+            <DataTemplate x:Key="SearchHitTemplate" x:DataType="models:SearchHitItem">
+                <Grid Padding="24,9,20,9" RowSpacing="2">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold" FontSize="14" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Column="1" Text="{x:Bind TimeText}" FontSize="12" Opacity="0.6" Margin="8,0,0,0" />
+                    <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{x:Bind Snippet}" FontSize="13" Opacity="0.72"
+                               TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" />
+                </Grid>
+            </DataTemplate>
+
+            <controls:InboxTemplateSelector x:Key="InboxSelector"
+                                            ConversationTemplate="{StaticResource ConversationTemplate}"
+                                            HeaderTemplate="{StaticResource SectionHeaderTemplate}"
+                                            HitTemplate="{StaticResource SearchHitTemplate}" />
+
+            <!-- ===== Transcript rows ===== -->
+            <DataTemplate x:Key="DayTemplate" x:DataType="models:DayItem">
+                <TextBlock Text="{x:Bind Text}" Margin="2,22,0,2" FontFamily="{StaticResource MetroDisplayFont}"
+                           FontSize="15" FontWeight="SemiLight" Opacity="0.6" />
+            </DataTemplate>
+
+            <DataTemplate x:Key="SystemTemplate" x:DataType="models:SystemItem">
+                <TextBlock Text="{x:Bind Text}" Margin="40,14,40,4" HorizontalAlignment="Center" TextAlignment="Center"
+                           TextWrapping="Wrap" FontSize="12" Opacity="0.55" />
+            </DataTemplate>
+
+            <DataTemplate x:Key="ReactionTemplate" x:DataType="models:ReactionChip">
+                <Button Style="{StaticResource FlatTextButtonStyle}" Background="{ThemeResource ChipBrush}"
+                        Padding="0" Click="ReactionChip_Click" ToolTipService.ToolTip="{x:Bind Tooltip}"
+                        AutomationProperties.Name="{x:Bind Tooltip}">
+                    <Border BorderBrush="{ThemeResource MetroAccentTextBrush}" BorderThickness="{x:Bind MineBorder}" Padding="7,2">
+                        <TextBlock Text="{x:Bind Text}" FontFamily="{StaticResource EmojiFont}" FontSize="13" />
+                    </Border>
+                </Button>
+            </DataTemplate>
+
+            <DataTemplate x:Key="IncomingTemplate" x:DataType="models:MessageItem">
+                <Grid Margin="{x:Bind RowMargin, Mode=OneWay}" HorizontalAlignment="Left" MaxWidth="580" ColumnSpacing="10"
+                      Background="Transparent" ContextRequested="Message_ContextRequested"
+                      AutomationProperties.Name="{x:Bind AutomationName, Mode=OneWay}">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid Width="34" Height="34" VerticalAlignment="Top" Margin="0,18,0,0"
+                          Background="{x:Bind SenderBrush, Mode=OneWay}"
+                          Visibility="{x:Bind AvatarSlotVisibility, Mode=OneWay}" Opacity="{x:Bind AvatarOpacity, Mode=OneWay}">
+                        <TextBlock Text="{x:Bind SenderInitials, Mode=OneWay}" Foreground="White" FontSize="13"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <Image Source="{x:Bind SenderAvatar, Mode=OneWay}" Stretch="UniformToFill"
+                               Visibility="{x:Bind SenderAvatarVisibility, Mode=OneWay}" />
+                    </Grid>
+                    <StackPanel Grid.Column="1">
+                        <TextBlock Text="{x:Bind SenderName, Mode=OneWay}" Visibility="{x:Bind SenderVisibility, Mode=OneWay}"
+                                   Foreground="{x:Bind SenderBrush, Mode=OneWay}" FontSize="12" FontWeight="SemiBold" Margin="0,0,0,3" />
+                        <Polygon Points="0,0 0,10 13,10" Fill="{ThemeResource IncomingBubbleBrush}" HorizontalAlignment="Left"
+                                 Visibility="{x:Bind TailVisibility, Mode=OneWay}" Opacity="{x:Bind BubbleOpacity, Mode=OneWay}" />
+                        <Border Background="{ThemeResource IncomingBubbleBrush}" HorizontalAlignment="Left" MinWidth="44"
+                                BorderBrush="{ThemeResource MetroAccentTextBrush}" BorderThickness="{x:Bind HighlightThickness, Mode=OneWay}"
+                                Opacity="{x:Bind BubbleOpacity, Mode=OneWay}">
+                            <StackPanel>
+                                <Border Visibility="{x:Bind ReplyVisibility, Mode=OneWay}" Margin="10,10,10,0" Padding="9,5"
+                                        BorderThickness="3,0,0,0" BorderBrush="{ThemeResource MetroAccentTextBrush}"
+                                        Background="{ThemeResource QuoteIncomingBrush}" Tapped="Reply_Tapped">
+                                    <StackPanel>
+                                        <TextBlock Text="{x:Bind ReplyHeader, Mode=OneWay}" FontSize="12" FontWeight="SemiBold"
+                                                   Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                        <TextBlock Text="{x:Bind ReplySnippet, Mode=OneWay}" FontSize="12" Opacity="0.75" MaxLines="2"
+                                                   TextTrimming="CharacterEllipsis" TextWrapping="Wrap" Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                    </StackPanel>
+                                </Border>
+                                <Image Source="{x:Bind MediaImage, Mode=OneWay}" Visibility="{x:Bind ImageVisibility, Mode=OneWay}"
+                                       MaxWidth="320" MaxHeight="360" Stretch="Uniform" HorizontalAlignment="Left" Tapped="Media_Tapped" />
+                                <Grid Width="240" Height="180" Background="{ThemeResource PlaceholderTileBrush}"
+                                      Visibility="{x:Bind ImagePlaceholderVisibility, Mode=OneWay}" Tapped="Media_Tapped">
+                                    <FontIcon Glyph="{x:Bind ImagePlaceholderGlyph, Mode=OneWay}" FontSize="28" Opacity="0.4" />
+                                    <ProgressRing IsActive="{x:Bind ImageLoading, Mode=OneWay}" Width="28" Height="28" />
+                                </Grid>
+                                <Grid Width="240" Height="150" Background="#FF1E1E1E" Visibility="{x:Bind VideoVisibility, Mode=OneWay}"
+                                      Tapped="Media_Tapped">
+                                    <Grid Width="52" Height="52">
+                                        <Ellipse Stroke="White" StrokeThickness="2" />
+                                        <FontIcon Glyph="&#xE768;" Foreground="White" FontSize="18" Margin="3,0,0,0" />
+                                    </Grid>
+                                    <TextBlock Text="video" Foreground="White" Opacity="0.75" FontSize="12" Margin="10,0,0,8"
+                                               VerticalAlignment="Bottom" />
+                                </Grid>
+                                <Grid Visibility="{x:Bind AudioVisibility, Mode=OneWay}" Padding="10,10,16,10" ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Button Style="{StaticResource CircleButtonStyle}" Content="{x:Bind AudioGlyph, Mode=OneWay}"
+                                            Foreground="{ThemeResource IncomingBubbleTextBrush}" BorderBrush="{ThemeResource IncomingBubbleTextBrush}"
+                                            Click="Audio_Click" AutomationProperties.Name="Play voice message" />
+                                    <TextBlock Grid.Column="1" Text="voice message" VerticalAlignment="Center"
+                                               Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                </Grid>
+                                <Button Style="{StaticResource FlatTextButtonStyle}" Visibility="{x:Bind FileVisibility, Mode=OneWay}"
+                                        Click="File_Click" HorizontalContentAlignment="Left" Padding="10">
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="40" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid Width="40" Height="40" Background="{ThemeResource MetroAccentBrush}">
+                                            <FontIcon Glyph="{x:Bind FileGlyph, Mode=OneWay}" Foreground="White" FontSize="18" />
+                                        </Grid>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="{x:Bind FileTitle, Mode=OneWay}" Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                            <TextBlock Text="{x:Bind FileSubtitle, Mode=OneWay}" FontSize="12" Opacity="0.65"
+                                                       Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                        </StackPanel>
+                                    </Grid>
+                                </Button>
+                                <TextBlock controls:Linkify.Text="{Binding Body}" Visibility="{x:Bind BodyVisibility, Mode=OneWay}"
+                                           FontSize="{x:Bind BodyFontSize, Mode=OneWay}" Foreground="{ThemeResource IncomingBubbleTextBrush}"
+                                           TextWrapping="Wrap" Margin="12,8,12,10" />
+                                <Button Style="{StaticResource FlatTextButtonStyle}" Visibility="{x:Bind LinkVisibility, Mode=OneWay}"
+                                        Click="Link_Click" HorizontalContentAlignment="Stretch" HorizontalAlignment="Stretch"
+                                        BorderBrush="{ThemeResource DividerBrush}" BorderThickness="0,1,0,0">
+                                    <StackPanel>
+                                        <Image Source="{x:Bind LinkImage, Mode=OneWay}" Visibility="{x:Bind LinkImageVisibility, Mode=OneWay}"
+                                               Height="150" Stretch="UniformToFill" />
+                                        <StackPanel Padding="12,8,12,10" Spacing="2">
+                                            <TextBlock Text="{x:Bind LinkSite, Mode=OneWay}" FontSize="11" Opacity="0.6"
+                                                       Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                            <TextBlock Text="{x:Bind LinkTitle, Mode=OneWay}" FontWeight="SemiBold" TextWrapping="Wrap" MaxLines="2"
+                                                       TextTrimming="CharacterEllipsis" Foreground="{ThemeResource IncomingBubbleTextBrush}" />
+                                            <TextBlock Text="{x:Bind LinkDescription, Mode=OneWay}" FontSize="12" Opacity="0.7" TextWrapping="Wrap"
+                                                       MaxLines="2" TextTrimming="CharacterEllipsis" Foreground="{ThemeResource IncomingBubbleTextBrush}"
+                                                       Visibility="{x:Bind LinkDescriptionVisibility, Mode=OneWay}" />
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+                        </Border>
+                        <ItemsControl ItemsSource="{x:Bind Reactions, Mode=OneWay}" ItemTemplate="{StaticResource ReactionTemplate}"
+                                      Visibility="{x:Bind ReactionsVisibility, Mode=OneWay}" Margin="6,4,0,0" HorizontalAlignment="Left">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="4" /></ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                        <TextBlock Text="{x:Bind MetaText, Mode=OneWay}" Visibility="{x:Bind MetaVisibility, Mode=OneWay}"
+                                   FontSize="11" Opacity="0.6" Margin="2,4,0,0" />
+                    </StackPanel>
+                </Grid>
+            </DataTemplate>
+
+            <DataTemplate x:Key="OutgoingTemplate" x:DataType="models:MessageItem">
+                <StackPanel Margin="{x:Bind RowMargin, Mode=OneWay}" HorizontalAlignment="Right" MaxWidth="580" Padding="60,0,0,0"
+                            Background="Transparent" ContextRequested="Message_ContextRequested"
+                            AutomationProperties.Name="{x:Bind AutomationName, Mode=OneWay}">
+                    <Border Background="{ThemeResource MetroAccentBrush}" HorizontalAlignment="Right" MinWidth="44"
+                            BorderBrush="{ThemeResource MetroAccentTextBrush}" BorderThickness="{x:Bind HighlightThickness, Mode=OneWay}"
+                            Opacity="{x:Bind BubbleOpacity, Mode=OneWay}">
+                        <StackPanel>
+                            <Border Visibility="{x:Bind ReplyVisibility, Mode=OneWay}" Margin="10,10,10,0" Padding="9,5"
+                                    BorderThickness="3,0,0,0" BorderBrush="White" Background="#26FFFFFF" Tapped="Reply_Tapped">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Bind ReplyHeader, Mode=OneWay}" FontSize="12" FontWeight="SemiBold" Foreground="White" />
+                                    <TextBlock Text="{x:Bind ReplySnippet, Mode=OneWay}" FontSize="12" Opacity="0.8" MaxLines="2"
+                                               TextTrimming="CharacterEllipsis" TextWrapping="Wrap" Foreground="White" />
+                                </StackPanel>
+                            </Border>
+                            <Image Source="{x:Bind MediaImage, Mode=OneWay}" Visibility="{x:Bind ImageVisibility, Mode=OneWay}"
+                                   MaxWidth="320" MaxHeight="360" Stretch="Uniform" HorizontalAlignment="Right" Tapped="Media_Tapped" />
+                            <Grid Width="240" Height="180" Background="#33FFFFFF" Visibility="{x:Bind ImagePlaceholderVisibility, Mode=OneWay}" Tapped="Media_Tapped">
+                                <FontIcon Glyph="{x:Bind ImagePlaceholderGlyph, Mode=OneWay}" FontSize="28" Foreground="White" Opacity="0.6" />
+                                <ProgressRing IsActive="{x:Bind ImageLoading, Mode=OneWay}" Width="28" Height="28" Foreground="White" />
+                            </Grid>
+                            <Grid Width="240" Height="150" Background="#FF1E1E1E" Visibility="{x:Bind VideoVisibility, Mode=OneWay}"
+                                  Tapped="Media_Tapped">
+                                <Grid Width="52" Height="52">
+                                    <Ellipse Stroke="White" StrokeThickness="2" />
+                                    <FontIcon Glyph="&#xE768;" Foreground="White" FontSize="18" Margin="3,0,0,0" />
+                                </Grid>
+                                <TextBlock Text="video" Foreground="White" Opacity="0.75" FontSize="12" Margin="10,0,0,8" VerticalAlignment="Bottom" />
+                            </Grid>
+                            <Grid Visibility="{x:Bind AudioVisibility, Mode=OneWay}" Padding="10,10,16,10" ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Button Style="{StaticResource CircleButtonStyle}" Content="{x:Bind AudioGlyph, Mode=OneWay}"
+                                        Foreground="White" BorderBrush="White" Click="Audio_Click" AutomationProperties.Name="Play voice message" />
+                                <TextBlock Grid.Column="1" Text="voice message" VerticalAlignment="Center" Foreground="White" />
+                            </Grid>
+                            <Button Style="{StaticResource FlatTextButtonStyle}" Visibility="{x:Bind FileVisibility, Mode=OneWay}"
+                                    Click="File_Click" HorizontalContentAlignment="Left" Padding="10" Foreground="White">
+                                <Grid ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="40" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid Width="40" Height="40" Background="#33FFFFFF">
+                                        <FontIcon Glyph="{x:Bind FileGlyph, Mode=OneWay}" Foreground="White" FontSize="18" />
+                                    </Grid>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="{x:Bind FileTitle, Mode=OneWay}" Foreground="White" />
+                                        <TextBlock Text="{x:Bind FileSubtitle, Mode=OneWay}" FontSize="12" Opacity="0.75" Foreground="White" />
+                                    </StackPanel>
+                                </Grid>
+                            </Button>
+                            <TextBlock controls:Linkify.Text="{Binding Body}" Visibility="{x:Bind BodyVisibility, Mode=OneWay}"
+                                       FontSize="{x:Bind BodyFontSize, Mode=OneWay}" Foreground="White"
+                                       TextWrapping="Wrap" Margin="12,8,12,10" />
+                            <Button Style="{StaticResource FlatTextButtonStyle}" Visibility="{x:Bind LinkVisibility, Mode=OneWay}"
+                                    Click="Link_Click" HorizontalContentAlignment="Stretch" HorizontalAlignment="Stretch"
+                                    BorderBrush="#40FFFFFF" BorderThickness="0,1,0,0" Foreground="White">
+                                <StackPanel>
+                                    <Image Source="{x:Bind LinkImage, Mode=OneWay}" Visibility="{x:Bind LinkImageVisibility, Mode=OneWay}"
+                                           Height="150" Stretch="UniformToFill" />
+                                    <StackPanel Padding="12,8,12,10" Spacing="2">
+                                        <TextBlock Text="{x:Bind LinkSite, Mode=OneWay}" FontSize="11" Opacity="0.75" Foreground="White" />
+                                        <TextBlock Text="{x:Bind LinkTitle, Mode=OneWay}" FontWeight="SemiBold" TextWrapping="Wrap" MaxLines="2"
+                                                   TextTrimming="CharacterEllipsis" Foreground="White" />
+                                        <TextBlock Text="{x:Bind LinkDescription, Mode=OneWay}" FontSize="12" Opacity="0.8" TextWrapping="Wrap"
+                                                   MaxLines="2" TextTrimming="CharacterEllipsis" Foreground="White"
+                                                   Visibility="{x:Bind LinkDescriptionVisibility, Mode=OneWay}" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Button>
+                        </StackPanel>
+                    </Border>
+                    <Polygon Points="0,0 13,0 13,10" Fill="{ThemeResource MetroAccentBrush}" HorizontalAlignment="Right"
+                             Visibility="{x:Bind TailVisibility, Mode=OneWay}" Opacity="{x:Bind BubbleOpacity, Mode=OneWay}" />
+                    <ItemsControl ItemsSource="{x:Bind Reactions, Mode=OneWay}" ItemTemplate="{StaticResource ReactionTemplate}"
+                                  Visibility="{x:Bind ReactionsVisibility, Mode=OneWay}" Margin="0,4,6,0" HorizontalAlignment="Right">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="4" /></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                    </ItemsControl>
+                    <TextBlock Text="{x:Bind MetaText, Mode=OneWay}" Visibility="{x:Bind MetaVisibility, Mode=OneWay}"
+                               FontSize="11" Opacity="0.6" Margin="0,4,2,0" HorizontalAlignment="Right" />
+                    <TextBlock Text="{x:Bind FailedText, Mode=OneWay}" Visibility="{x:Bind FailedVisibility, Mode=OneWay}"
+                               FontSize="11" Foreground="{ThemeResource FailedBrush}" Margin="0,4,2,0" HorizontalAlignment="Right"
+                               TextWrapping="Wrap" />
+                </StackPanel>
+            </DataTemplate>
+
+            <controls:ThreadTemplateSelector x:Key="ThreadSelector"
+                                             DayTemplate="{StaticResource DayTemplate}"
+                                             IncomingTemplate="{StaticResource IncomingTemplate}"
+                                             OutgoingTemplate="{StaticResource OutgoingTemplate}"
+                                             SystemTemplate="{StaticResource SystemTemplate}" />
+
+            <DataTemplate x:Key="AttachmentTemplate" x:DataType="models:AttachmentItem">
+                <Grid Width="76" Height="76" Background="{ThemeResource PlaceholderTileBrush}" ToolTipService.ToolTip="{x:Bind Name}">
+                    <StackPanel VerticalAlignment="Center" Spacing="4" Visibility="{x:Bind GlyphVisibility, Mode=OneWay}">
+                        <FontIcon Glyph="{x:Bind Glyph}" FontSize="22" />
+                        <TextBlock Text="{x:Bind SizeText}" FontSize="10" Opacity="0.7" HorizontalAlignment="Center" />
+                    </StackPanel>
+                    <Image Source="{x:Bind Thumbnail, Mode=OneWay}" Stretch="UniformToFill" Visibility="{x:Bind ThumbnailVisibility, Mode=OneWay}" />
+                    <Button Width="22" Height="22" Padding="0" HorizontalAlignment="Right" VerticalAlignment="Top"
+                            Background="#CC000000" Foreground="White" BorderThickness="0" Click="RemoveAttachment_Click"
+                            AutomationProperties.Name="Remove attachment">
+                        <FontIcon Glyph="&#xE711;" FontSize="10" />
+                    </Button>
+                </Grid>
+            </DataTemplate>
+
+            <Storyboard x:Key="TypingStoryboard" RepeatBehavior="Forever">
+                <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Dot1" Storyboard.TargetProperty="Opacity">
+                    <LinearDoubleKeyFrame KeyTime="0:0:0" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.3" Value="1" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.6" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:1.2" Value="0.25" />
+                </DoubleAnimationUsingKeyFrames>
+                <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Dot2" Storyboard.TargetProperty="Opacity">
+                    <LinearDoubleKeyFrame KeyTime="0:0:0" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.2" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.5" Value="1" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.8" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:1.2" Value="0.25" />
+                </DoubleAnimationUsingKeyFrames>
+                <DoubleAnimationUsingKeyFrames Storyboard.TargetName="Dot3" Storyboard.TargetProperty="Opacity">
+                    <LinearDoubleKeyFrame KeyTime="0:0:0" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.4" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:0.7" Value="1" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:1.0" Value="0.25" />
+                    <LinearDoubleKeyFrame KeyTime="0:0:1.2" Value="0.25" />
+                </DoubleAnimationUsingKeyFrames>
+            </Storyboard>
+        </Grid.Resources>
+
+        <Grid.RowDefinitions>
+            <RowDefinition Height="38" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- ===== Title bar ===== -->
+        <Grid x:Name="TitleBarArea" Background="Transparent" Padding="14,0,150,0">
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <Image Source="Assets/AppIcon.png" Width="16" Height="16" />
+                <TextBlock Text="My Phone" FontSize="12" VerticalAlignment="Center" />
+                <Ellipse x:Name="ConnectionDot" Width="7" Height="7" VerticalAlignment="Center" Margin="4,0,0,0"
+                         Fill="{ThemeResource TextFillColorTertiaryBrush}" Visibility="Collapsed" />
+                <TextBlock x:Name="ConnectionText" FontSize="12" Opacity="0.6" VerticalAlignment="Center" />
+            </StackPanel>
+        </Grid>
+
+        <!-- ===== Pairing ===== -->
+        <ScrollViewer x:Name="PairingPanel" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel MaxWidth="760" HorizontalAlignment="Left" Margin="56,24,40,40" Spacing="22">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="connect your phone" Style="{StaticResource MetroHeaderText}" FontSize="52" LineHeight="56" />
+                    <TextBlock Text="Pair with Google Messages using your Google account. Your Android phone stays the device that sends RCS and SMS."
+                               TextWrapping="Wrap" FontSize="16" Opacity="0.72" />
+                </StackPanel>
+                <ItemsControl x:Name="PairingSteps" IsTabStop="False">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate><StackPanel Spacing="14" /></ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                </ItemsControl>
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <ComboBox x:Name="PairingBrowser" Header="browser for pairing" MinWidth="150">
+                        <ComboBoxItem Content="Firefox" Tag="firefox" />
+                        <ComboBoxItem Content="Chrome" Tag="chrome" />
+                        <ComboBoxItem Content="Edge" Tag="edge" />
+                    </ComboBox>
+                    <Button Content="open Google sign-in" Click="OpenSignIn_Click" Padding="18,8" VerticalAlignment="Bottom" />
+                </StackPanel>
+                <TextBox x:Name="CookieInput" Header="paste the copied cURL command (Ctrl+V)" PlaceholderText="curl 'https://messages.google.com/web/config' ..."
+                         AcceptsReturn="True" TextWrapping="Wrap" Height="110" FontFamily="Cascadia Mono, Consolas" FontSize="12" />
+                <Grid x:Name="EmojiPanel" Visibility="Collapsed" ColumnSpacing="20">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid Width="120" Height="120" Background="{ThemeResource MetroAccentBrush}">
+                        <TextBlock x:Name="EmojiText" FontFamily="{StaticResource EmojiFont}" FontSize="60"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Grid>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="6">
+                        <TextBlock Text="tap this emoji on your phone" Style="{StaticResource MetroSubheaderText}" FontSize="26" TextWrapping="Wrap" />
+                        <TextBlock Text="Google Messages → account menu → Device pairing" Opacity="0.7" TextWrapping="Wrap" />
+                    </StackPanel>
+                </Grid>
+                <StackPanel Orientation="Horizontal" Spacing="16">
+                    <Button x:Name="PairButton" Content="pair phone" Click="Pair_Click" Style="{StaticResource AccentButtonStyle}" Padding="22,8" />
+                    <ProgressRing x:Name="PairProgress" IsActive="False" Width="24" Height="24" />
+                </StackPanel>
+                <TextBlock x:Name="PairStatus" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                <TextBlock Text="The command contains sensitive Google cookies. It goes only to the local pairing process and the box is cleared after you submit it."
+                           FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- ===== Inbox ===== -->
+        <Grid x:Name="InboxPanel" Grid.Row="1" Visibility="Collapsed">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="ListColumn" Width="380" />
+                <ColumnDefinition x:Name="ThreadColumn" Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Grid x:Name="ListPane" Background="{ThemeResource PaneBrush}">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <Grid Margin="24,4,20,0">
+                    <TextBlock Text="messages" Style="{StaticResource MetroHeaderText}" VerticalAlignment="Center" />
+                    <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right" VerticalAlignment="Center">
+                        <Button Style="{StaticResource CircleButtonStyle}" Content="&#xE710;" Click="NewChat_Click"
+                                ToolTipService.ToolTip="New conversation (Ctrl+N)" AutomationProperties.Name="New conversation" />
+                        <Button Style="{StaticResource CircleButtonStyle}" Content="&#xE712;"
+                                ToolTipService.ToolTip="More" AutomationProperties.Name="More options">
+                            <Button.Flyout>
+                                <MenuFlyout Placement="BottomEdgeAlignedRight">
+                                    <MenuFlyoutItem Text="Mark all as read" Click="MarkAllRead_Click">
+                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8C3;" /></MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Refresh" Click="Refresh_Click">
+                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE72C;" /></MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <ToggleMenuFlyoutItem x:Name="NotificationsToggle" Text="Notifications" IsChecked="True" Click="NotificationsToggle_Click" />
+                                    <MenuFlyoutSeparator />
+                                    <MenuFlyoutItem Text="Pair again" Click="PairAgain_Click">
+                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8EA;" /></MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="24,12,0,12">
+                    <Button x:Name="FilterAll" Content="all" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="all" />
+                    <Button x:Name="FilterUnread" Content="unread" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="unread" />
+                    <Button x:Name="FilterArchived" Content="archived" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="archived" />
+                </StackPanel>
+                <StackPanel Grid.Row="2">
+                    <Grid x:Name="AuthBanner" Margin="24,0,20,12" Padding="14,10" Background="{ThemeResource MetroAccentBrush}"
+                          Visibility="Collapsed" RequestedTheme="Dark" RowSpacing="6">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock x:Name="AuthBannerText" Foreground="White" TextWrapping="Wrap" FontSize="13" />
+                        <Button x:Name="AuthBannerAction" Grid.Row="1" Content="pair again" Style="{StaticResource FlatTextButtonStyle}" Foreground="White"
+                                FontWeight="SemiBold" Padding="0,2" Click="AuthBannerAction_Click" />
+                    </Grid>
+                    <TextBox x:Name="SearchBox" Margin="24,0,20,10" PlaceholderText="search people and messages"
+                             TextChanged="SearchBox_TextChanged" KeyDown="SearchBox_KeyDown" AutomationProperties.Name="Search" />
+                </StackPanel>
+                <ListView x:Name="ConversationList" Grid.Row="3" SelectionMode="Single" Padding="0,0,0,12"
+                          ItemContainerStyle="{StaticResource MetroListItemStyle}"
+                          ItemTemplateSelector="{StaticResource InboxSelector}"
+                          SelectionChanged="ConversationList_SelectionChanged"
+                          ContainerContentChanging="ConversationList_ContainerContentChanging">
+                    <ListView.ItemContainerTransitions>
+                        <TransitionCollection>
+                            <EntranceThemeTransition IsStaggeringEnabled="True" FromVerticalOffset="0" FromHorizontalOffset="40" />
+                            <RepositionThemeTransition />
+                        </TransitionCollection>
+                    </ListView.ItemContainerTransitions>
+                </ListView>
+                <StackPanel x:Name="ListEmpty" Grid.Row="3" Margin="24,20,24,0" Spacing="6" Visibility="Collapsed">
+                    <TextBlock x:Name="ListEmptyTitle" FontFamily="{StaticResource MetroDisplayFont}" FontSize="24" FontWeight="Light" />
+                    <TextBlock x:Name="ListEmptyText" Opacity="0.6" TextWrapping="Wrap" />
+                </StackPanel>
+            </Grid>
+
+            <Grid x:Name="ThreadPane" Grid.Column="1" AllowDrop="True" DragOver="Thread_DragOver" Drop="Thread_Drop">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid x:Name="ThreadHeader" Margin="20,4,20,10" ColumnSpacing="14" Visibility="Collapsed">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="BackButton" Style="{StaticResource CircleButtonStyle}" Content="&#xE72B;" Visibility="Collapsed"
+                            Click="Back_Click" AutomationProperties.Name="Back" />
+                    <Grid x:Name="ThreadAvatarTile" Grid.Column="1" Width="48" Height="48">
+                        <TextBlock x:Name="ThreadAvatarInitials" Foreground="White" FontFamily="{StaticResource MetroDisplayFont}" FontSize="20"
+                                   FontWeight="Light" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <FontIcon x:Name="ThreadAvatarGroup" Glyph="&#xE716;" Foreground="White" FontSize="20" Visibility="Collapsed" />
+                        <Image x:Name="ThreadAvatarImage" Stretch="UniformToFill" />
+                    </Grid>
+                    <StackPanel Grid.Column="2" VerticalAlignment="Center">
+                        <TextBlock x:Name="ThreadTitle" Style="{StaticResource MetroSubheaderText}" />
+                        <TextBlock x:Name="ThreadSubtitle" Style="{StaticResource MetroCaptionText}" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                        <Button x:Name="ThreadArchiveButton" Style="{StaticResource CircleButtonStyle}" Content="&#xE7B8;"
+                                Click="ThreadArchive_Click" ToolTipService.ToolTip="Archive" AutomationProperties.Name="Archive" />
+                        <Button x:Name="ThreadMoreButton" Style="{StaticResource CircleButtonStyle}" Content="&#xE712;"
+                                Click="ThreadMore_Click" ToolTipService.ToolTip="More" AutomationProperties.Name="Conversation options" />
+                    </StackPanel>
+                </Grid>
+
+                <ListView x:Name="MessageList" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="False"
+                          Padding="24,0,24,12" ItemContainerStyle="{StaticResource TranscriptItemStyle}"
+                          ItemTemplateSelector="{StaticResource ThreadSelector}"
+                          ContainerContentChanging="MessageList_ContainerContentChanging"
+                          IsTabStop="False" TabNavigation="Once">
+                    <ListView.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <ItemsStackPanel ItemsUpdatingScrollMode="KeepItemsInView" VerticalAlignment="Bottom" />
+                        </ItemsPanelTemplate>
+                    </ListView.ItemsPanel>
+                    <ListView.ItemContainerTransitions>
+                        <TransitionCollection>
+                            <AddDeleteThemeTransition />
+                        </TransitionCollection>
+                    </ListView.ItemContainerTransitions>
+                </ListView>
+                <ProgressBar x:Name="OlderProgress" Grid.Row="1" VerticalAlignment="Top" IsIndeterminate="True" Visibility="Collapsed" />
+
+                <StackPanel x:Name="ThreadEmpty" Grid.RowSpan="6" VerticalAlignment="Center" HorizontalAlignment="Left" Margin="64,0,40,0" Spacing="8">
+                    <FontIcon Glyph="&#xE8BD;" FontSize="56" HorizontalAlignment="Left" Opacity="0.25" Margin="0,0,0,12" />
+                    <TextBlock x:Name="ThreadEmptyTitle" Text="select a conversation" Style="{StaticResource MetroHeaderText}" FontSize="40" />
+                    <TextBlock x:Name="ThreadEmptyText" Text="Or press Ctrl+N to start a new one." Opacity="0.6" FontSize="15" TextWrapping="Wrap" />
+                </StackPanel>
+
+                <StackPanel x:Name="TypingPanel" Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="26,0,24,6" Visibility="Collapsed">
+                    <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                        <Ellipse x:Name="Dot1" Width="6" Height="6" Fill="{ThemeResource MetroAccentTextBrush}" />
+                        <Ellipse x:Name="Dot2" Width="6" Height="6" Fill="{ThemeResource MetroAccentTextBrush}" />
+                        <Ellipse x:Name="Dot3" Width="6" Height="6" Fill="{ThemeResource MetroAccentTextBrush}" />
+                    </StackPanel>
+                    <TextBlock x:Name="TypingText" FontSize="12" Opacity="0.75" VerticalAlignment="Center" />
+                </StackPanel>
+
+                <Grid x:Name="ReplyBar" Grid.Row="3" Margin="24,4,24,0" Visibility="Collapsed" Background="{ThemeResource PlaceholderTileBrush}">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="4" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Rectangle Fill="{ThemeResource MetroAccentBrush}" />
+                    <StackPanel Grid.Column="1" Padding="12,7">
+                        <TextBlock x:Name="ReplyBarHeader" FontSize="12" FontWeight="SemiBold" Foreground="{ThemeResource MetroAccentTextBrush}" />
+                        <TextBlock x:Name="ReplyBarSnippet" FontSize="13" Opacity="0.75" TextTrimming="CharacterEllipsis" MaxLines="1" />
+                    </StackPanel>
+                    <Button Grid.Column="2" Style="{StaticResource FlatTextButtonStyle}" Width="40" Height="40" Click="CancelReply_Click"
+                            AutomationProperties.Name="Cancel reply" VerticalAlignment="Center">
+                        <FontIcon Glyph="&#xE711;" FontSize="12" />
+                    </Button>
+                </Grid>
+
+                <ItemsControl x:Name="AttachmentTray" Grid.Row="4" Margin="24,8,24,0" Visibility="Collapsed"
+                              ItemTemplate="{StaticResource AttachmentTemplate}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="8" /></ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                </ItemsControl>
+
+                <Grid x:Name="ComposerPanel" Grid.Row="5" Margin="20,8,20,16" ColumnSpacing="10" Visibility="Collapsed">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Button Style="{StaticResource CircleButtonStyle}" Content="&#xE723;" VerticalAlignment="Bottom" Margin="0,0,0,1"
+                            Click="Attach_Click" ToolTipService.ToolTip="Attach photo, video or file" AutomationProperties.Name="Attach" />
+                    <TextBox x:Name="Composer" Grid.Column="1" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="42" MaxHeight="160"
+                             PlaceholderText="type a message" FontSize="15" Padding="12,10,12,8"
+                             ScrollViewer.VerticalScrollBarVisibility="Auto"
+                             PreviewKeyDown="Composer_PreviewKeyDown" Paste="Composer_Paste" TextChanged="Composer_TextChanged"
+                             AutomationProperties.Name="Message" />
+                    <Button x:Name="SendButton" Grid.Column="2" Style="{StaticResource AccentCircleButtonStyle}" Content="&#xE724;"
+                            VerticalAlignment="Bottom" Margin="0,0,0,1" Click="Send_Click" IsEnabled="False"
+                            ToolTipService.ToolTip="Send (Enter)" AutomationProperties.Name="Send" />
+                    <TextBlock x:Name="ComposerHint" Grid.Row="1" Grid.Column="1" FontSize="11" Opacity="0.5" Margin="2,5,0,0" />
+                </Grid>
+            </Grid>
+        </Grid>
+
+        <!-- ===== Status banner ===== -->
+        <Border x:Name="StatusBanner" Grid.Row="1" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,96"
+                Background="#F0202020" Padding="18,10" Visibility="Collapsed" MaxWidth="560" RequestedTheme="Dark">
+            <StackPanel Orientation="Horizontal" Spacing="18">
+                <TextBlock x:Name="StatusText" Foreground="White" TextWrapping="Wrap" VerticalAlignment="Center" MaxWidth="440" />
+                <Button x:Name="StatusAction" Style="{StaticResource FlatTextButtonStyle}" Foreground="{ThemeResource MetroAccentTextBrush}"
+                        Padding="6,2" Visibility="Collapsed" Click="StatusAction_Click" VerticalAlignment="Center" />
+            </StackPanel>
+        </Border>
+
+        <!-- ===== Full-window media viewer ===== -->
+        <Grid x:Name="ViewerOverlay" Grid.RowSpan="2" Visibility="Collapsed" Background="#F2000000" RequestedTheme="Dark"
+              Tapped="ViewerBackground_Tapped">
+            <Image x:Name="ViewerImage" Stretch="Uniform" Margin="40,80,40,40" />
+            <MediaPlayerElement x:Name="ViewerPlayer" Margin="40,80,40,40" AreTransportControlsEnabled="True" Visibility="Collapsed" />
+            <Grid VerticalAlignment="Top" Margin="40,44,40,0">
+                <TextBlock x:Name="ViewerTitle" Foreground="White" FontFamily="{StaticResource MetroDisplayFont}" FontSize="22"
+                           FontWeight="Light" VerticalAlignment="Center" />
+                <StackPanel Orientation="Horizontal" Spacing="12" HorizontalAlignment="Right">
+                    <Button Style="{StaticResource LightCircleButtonStyle}" Content="&#xE74E;" Click="ViewerSave_Click"
+                            ToolTipService.ToolTip="Save" AutomationProperties.Name="Save" />
+                    <Button Style="{StaticResource LightCircleButtonStyle}" Content="&#xE8BB;" Click="ViewerClose_Click"
+                            ToolTipService.ToolTip="Close (Esc)" AutomationProperties.Name="Close" />
+                </StackPanel>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

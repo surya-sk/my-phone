@@ -1,0 +1,18 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Messages", "Messages\Messages.csproj", "{4B25E437-1CB0-4A32-96A4-C6C542926B41}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{4B25E437-1CB0-4A32-96A4-C6C542926B41}.Debug|x64.ActiveCfg = Debug|x64
+		{4B25E437-1CB0-4A32-96A4-C6C542926B41}.Debug|x64.Build.0 = Debug|x64
+		{4B25E437-1CB0-4A32-96A4-C6C542926B41}.Release|x64.ActiveCfg = Release|x64
+		{4B25E437-1CB0-4A32-96A4-C6C542926B41}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+EndGlobal

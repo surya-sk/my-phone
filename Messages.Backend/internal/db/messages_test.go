@@ -1,0 +1,1613 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// newTestStore creates an in-memory Store for testing.
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+func TestUpsertMessage_InsertAndUpdate(t *testing.T) {
+	store := newTestStore(t)
+
+	t.Run("insert new message", func(t *testing.T) {
+		msg := &Message{
+			MessageID:      "msg-1",
+			ConversationID: "conv-1",
+			SenderName:     "Alice",
+			SenderNumber:   "+15551234567",
+			Body:           "Hello",
+			TimestampMS:    1000,
+			Status:         "sent",
+			IsFromMe:       false,
+		}
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("insert message: %v", err)
+		}
+
+		got, err := store.GetMessageByID("msg-1")
+		if err != nil {
+			t.Fatalf("get message: %v", err)
+		}
+		if got == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if got.Body != "Hello" {
+			t.Errorf("body: got %q, want %q", got.Body, "Hello")
+		}
+		if got.SenderName != "Alice" {
+			t.Errorf("sender_name: got %q, want %q", got.SenderName, "Alice")
+		}
+		if got.Status != "sent" {
+			t.Errorf("status: got %q, want %q", got.Status, "sent")
+		}
+		if got.SourcePlatform != "sms" {
+			t.Errorf("source platform: got %q, want sms", got.SourcePlatform)
+		}
+	})
+
+	t.Run("update existing message", func(t *testing.T) {
+		msg := &Message{
+			MessageID:      "msg-1",
+			ConversationID: "conv-1",
+			SenderName:     "Alice",
+			SenderNumber:   "+15551234567",
+			Body:           "Hello (edited)",
+			TimestampMS:    1000,
+			Status:         "delivered",
+			IsFromMe:       false,
+		}
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("update message: %v", err)
+		}
+
+		got, err := store.GetMessageByID("msg-1")
+		if err != nil {
+			t.Fatalf("get message: %v", err)
+		}
+		if got.Body != "Hello (edited)" {
+			t.Errorf("body after update: got %q, want %q", got.Body, "Hello (edited)")
+		}
+		if got.Status != "delivered" {
+			t.Errorf("status after update: got %q, want %q", got.Status, "delivered")
+		}
+	})
+
+	t.Run("upsert preserves all fields", func(t *testing.T) {
+		msg := &Message{
+			MessageID:      "msg-full",
+			ConversationID: "conv-1",
+			SenderName:     "Bob",
+			SenderNumber:   "+15559876543",
+			Body:           "Full message",
+			TimestampMS:    2000,
+			Status:         "read",
+			IsFromMe:       true,
+			MentionsMe:     true,
+			MediaID:        "media-xyz",
+			MimeType:       "image/png",
+			DecryptionKey:  "deadbeef",
+			Reactions:      `[{"emoji":"thumbsup","count":1}]`,
+			ReplyToID:      "msg-1",
+		}
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("upsert full message: %v", err)
+		}
+
+		got, err := store.GetMessageByID("msg-full")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got.MediaID != "media-xyz" {
+			t.Errorf("MediaID: got %q, want %q", got.MediaID, "media-xyz")
+		}
+		if got.MimeType != "image/png" {
+			t.Errorf("MimeType: got %q, want %q", got.MimeType, "image/png")
+		}
+		if got.DecryptionKey != "deadbeef" {
+			t.Errorf("DecryptionKey: got %q, want %q", got.DecryptionKey, "deadbeef")
+		}
+		if got.Reactions != `[{"emoji":"thumbsup","count":1}]` {
+			t.Errorf("Reactions: got %q", got.Reactions)
+		}
+		if got.ReplyToID != "msg-1" {
+			t.Errorf("ReplyToID: got %q, want %q", got.ReplyToID, "msg-1")
+		}
+		if !got.IsFromMe {
+			t.Error("IsFromMe: got false, want true")
+		}
+		if !got.MentionsMe {
+			t.Error("MentionsMe: got false, want true")
+		}
+	})
+
+	t.Run("upsert ignores transcript fields", func(t *testing.T) {
+		msg := &Message{
+			MessageID:       "msg-transcript",
+			ConversationID:  "conv-1",
+			Body:            "[Voice note]",
+			MediaID:         "media-1",
+			MimeType:        "audio/ogg",
+			TimestampMS:     3000,
+			Transcript:      "seeded transcript",
+			TranscribedAtMS: 12345,
+			TranscriptModel: "whisper-large-v3",
+			SourcePlatform:  "sms",
+			SenderName:      "Alice",
+			SenderNumber:    "+15551234567",
+		}
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("upsert transcript-bearing message: %v", err)
+		}
+
+		got, err := store.GetMessageByID("msg-transcript")
+		if err != nil {
+			t.Fatalf("get message: %v", err)
+		}
+		if got == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if got.Transcript != "" || got.TranscribedAtMS != 0 || got.TranscriptModel != "" {
+			t.Fatalf("UpsertMessage should not persist transcript fields, got transcript=%q transcribed_at=%d model=%q", got.Transcript, got.TranscribedAtMS, got.TranscriptModel)
+		}
+	})
+}
+
+// TestUpsertMessage_StatusUpdatePreservesContent guards the data-loss path
+// where a status-only re-delivery of an existing message_id (empty media /
+// reactions / body, as happens on delivery/read receipts) must NOT wipe the
+// media references and reactions already stored on the complete row.
+func TestUpsertMessage_StatusUpdatePreservesContent(t *testing.T) {
+	store := newTestStore(t)
+
+	full := &Message{
+		MessageID:      "msg-media",
+		ConversationID: "conv-1",
+		SenderName:     "Alice",
+		SenderNumber:   "+15551234567",
+		Body:           "Check this photo",
+		TimestampMS:    1000,
+		Status:         "sent",
+		MediaID:        "media-abc",
+		MimeType:       "image/jpeg",
+		DecryptionKey:  "cafebabe",
+		Reactions:      `[{"emoji":"heart","count":2}]`,
+		ReplyToID:      "msg-0",
+	}
+	if err := store.UpsertMessage(full); err != nil {
+		t.Fatalf("insert full message: %v", err)
+	}
+
+	// Simulate a status-only update: same message_id, only status changes,
+	// content fields empty (this is exactly what the live bridges re-deliver).
+	statusOnly := &Message{
+		MessageID:      "msg-media",
+		ConversationID: "conv-1",
+		SenderName:     "",
+		SenderNumber:   "",
+		Body:           "",
+		TimestampMS:    0,
+		Status:         "delivered",
+	}
+	if err := store.UpsertMessage(statusOnly); err != nil {
+		t.Fatalf("status-only upsert: %v", err)
+	}
+
+	got, err := store.GetMessageByID("msg-media")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// Volatile field updated...
+	if got.Status != "delivered" {
+		t.Errorf("status: got %q, want %q", got.Status, "delivered")
+	}
+	// ...content preserved.
+	if got.MediaID != "media-abc" {
+		t.Errorf("MediaID wiped: got %q, want %q", got.MediaID, "media-abc")
+	}
+	if got.MimeType != "image/jpeg" {
+		t.Errorf("MimeType wiped: got %q, want %q", got.MimeType, "image/jpeg")
+	}
+	if got.DecryptionKey != "cafebabe" {
+		t.Errorf("DecryptionKey wiped: got %q, want %q", got.DecryptionKey, "cafebabe")
+	}
+	if got.Reactions != `[{"emoji":"heart","count":2}]` {
+		t.Errorf("Reactions wiped: got %q", got.Reactions)
+	}
+	if got.Body != "Check this photo" {
+		t.Errorf("Body wiped: got %q, want %q", got.Body, "Check this photo")
+	}
+	if got.SenderName != "Alice" {
+		t.Errorf("SenderName wiped: got %q, want %q", got.SenderName, "Alice")
+	}
+	if got.TimestampMS != 1000 {
+		t.Errorf("TimestampMS wiped: got %d, want %d", got.TimestampMS, 1000)
+	}
+	if got.ReplyToID != "msg-0" {
+		t.Errorf("ReplyToID wiped: got %q, want %q", got.ReplyToID, "msg-0")
+	}
+
+	// A genuine edit (non-empty body) must still update the body.
+	edit := &Message{
+		MessageID:      "msg-media",
+		ConversationID: "conv-1",
+		Body:           "Check this photo (edited)",
+		TimestampMS:    1500,
+		Status:         "delivered",
+	}
+	if err := store.UpsertMessage(edit); err != nil {
+		t.Fatalf("edit upsert: %v", err)
+	}
+	got, err = store.GetMessageByID("msg-media")
+	if err != nil {
+		t.Fatalf("get after edit: %v", err)
+	}
+	if got.Body != "Check this photo (edited)" {
+		t.Errorf("edit not applied: got %q", got.Body)
+	}
+	if got.MediaID != "media-abc" {
+		t.Errorf("MediaID wiped on edit: got %q", got.MediaID)
+	}
+}
+
+func TestGetMessages_Filters(t *testing.T) {
+	store := newTestStore(t)
+
+	// Seed messages from different senders at different times.
+	msgs := []Message{
+		{MessageID: "m1", ConversationID: "c1", SenderNumber: "+1111", Body: "A", TimestampMS: 1000},
+		{MessageID: "m2", ConversationID: "c1", SenderNumber: "+2222", Body: "B", TimestampMS: 2000},
+		{MessageID: "m3", ConversationID: "c1", SenderNumber: "+1111", Body: "C", TimestampMS: 3000},
+		{MessageID: "m4", ConversationID: "c2", SenderNumber: "+1111", Body: "D", TimestampMS: 4000},
+		{MessageID: "m5", ConversationID: "c2", SenderNumber: "+3333", Body: "E", TimestampMS: 5000},
+	}
+	for i := range msgs {
+		if err := store.UpsertMessage(&msgs[i]); err != nil {
+			t.Fatalf("seed message %d: %v", i, err)
+		}
+	}
+
+	t.Run("filter by phone number", func(t *testing.T) {
+		got, err := store.GetMessages("+1111", 0, 0, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("count: got %d, want 3", len(got))
+		}
+		// Results should be ordered by timestamp DESC.
+		if got[0].MessageID != "m4" {
+			t.Errorf("first result: got %q, want m4", got[0].MessageID)
+		}
+	})
+
+	t.Run("filter by after timestamp", func(t *testing.T) {
+		got, err := store.GetMessages("", 3000, 0, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("count: got %d, want 3 (timestamps 3000, 4000, 5000)", len(got))
+		}
+	})
+
+	t.Run("filter by before timestamp", func(t *testing.T) {
+		got, err := store.GetMessages("", 0, 2000, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("count: got %d, want 2 (timestamps 1000, 2000)", len(got))
+		}
+	})
+
+	t.Run("filter by after and before timestamp", func(t *testing.T) {
+		got, err := store.GetMessages("", 2000, 4000, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("count: got %d, want 3 (timestamps 2000, 3000, 4000)", len(got))
+		}
+	})
+
+	t.Run("filter by phone number and time range", func(t *testing.T) {
+		got, err := store.GetMessages("+1111", 1500, 3500, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("count: got %d, want 1 (only m3 at 3000)", len(got))
+		}
+		if got[0].MessageID != "m3" {
+			t.Errorf("got %q, want m3", got[0].MessageID)
+		}
+	})
+
+	t.Run("limit constrains results", func(t *testing.T) {
+		got, err := store.GetMessages("", 0, 0, 2)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("count: got %d, want 2", len(got))
+		}
+		// Should be the two most recent (DESC order).
+		if got[0].MessageID != "m5" {
+			t.Errorf("first: got %q, want m5", got[0].MessageID)
+		}
+		if got[1].MessageID != "m4" {
+			t.Errorf("second: got %q, want m4", got[1].MessageID)
+		}
+	})
+
+	t.Run("no filters returns all up to limit", func(t *testing.T) {
+		got, err := store.GetMessages("", 0, 0, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 5 {
+			t.Fatalf("count: got %d, want 5", len(got))
+		}
+	})
+
+	t.Run("wrong phone number returns empty", func(t *testing.T) {
+		got, err := store.GetMessages("+9999", 0, 0, 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("count: got %d, want 0", len(got))
+		}
+	})
+}
+
+func TestGetMessagesByConversation(t *testing.T) {
+	store := newTestStore(t)
+
+	// Seed messages across two conversations.
+	for i := 0; i < 5; i++ {
+		store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("c1-m%d", i),
+			ConversationID: "conv-1",
+			Body:           fmt.Sprintf("msg %d", i),
+			TimestampMS:    int64(1000 + i*100),
+		})
+	}
+	for i := 0; i < 3; i++ {
+		store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("c2-m%d", i),
+			ConversationID: "conv-2",
+			Body:           fmt.Sprintf("msg %d", i),
+			TimestampMS:    int64(2000 + i*100),
+		})
+	}
+
+	t.Run("returns only messages from specified conversation", func(t *testing.T) {
+		got, err := store.GetMessagesByConversation("conv-1", 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 5 {
+			t.Fatalf("count: got %d, want 5", len(got))
+		}
+		for _, m := range got {
+			if m.ConversationID != "conv-1" {
+				t.Errorf("message %s has conversation %q, want conv-1", m.MessageID, m.ConversationID)
+			}
+		}
+	})
+
+	t.Run("ordered by timestamp DESC", func(t *testing.T) {
+		got, err := store.GetMessagesByConversation("conv-1", 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i].TimestampMS > got[i-1].TimestampMS {
+				t.Errorf("not DESC: msg[%d].ts=%d > msg[%d].ts=%d", i, got[i].TimestampMS, i-1, got[i-1].TimestampMS)
+			}
+		}
+	})
+
+	t.Run("limit constrains results", func(t *testing.T) {
+		got, err := store.GetMessagesByConversation("conv-1", 3)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("count: got %d, want 3", len(got))
+		}
+	})
+
+	t.Run("nonexistent conversation returns empty", func(t *testing.T) {
+		got, err := store.GetMessagesByConversation("nonexistent", 100)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("count: got %d, want 0", len(got))
+		}
+	})
+}
+
+func TestGetMessagesByConversationsReturnsNewestLimitAscending(t *testing.T) {
+	store := newTestStore(t)
+
+	for i := 0; i < 6; i++ {
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("conv-1-%d", i),
+			ConversationID: "conv-1",
+			Body:           fmt.Sprintf("c1 msg %d", i),
+			TimestampMS:    int64(1000 + i*100),
+		}); err != nil {
+			t.Fatalf("seed conv-1 message %d: %v", i, err)
+		}
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("conv-2-%d", i),
+			ConversationID: "conv-2",
+			Body:           fmt.Sprintf("c2 msg %d", i),
+			TimestampMS:    int64(1050 + i*100),
+		}); err != nil {
+			t.Fatalf("seed conv-2 message %d: %v", i, err)
+		}
+	}
+
+	got, err := store.GetMessagesByConversations([]string{"conv-1", "conv-2"}, 5)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("count: got %d, want 5", len(got))
+	}
+
+	wantIDs := []string{"conv-2-3", "conv-1-4", "conv-2-4", "conv-1-5", "conv-2-5"}
+	for i, want := range wantIDs {
+		if got[i].MessageID != want {
+			t.Fatalf("msg[%d]: got %q, want %q", i, got[i].MessageID, want)
+		}
+	}
+}
+
+func TestGetMessagesByConversationsRangeReturnsNewestLimitAscending(t *testing.T) {
+	store := newTestStore(t)
+
+	for i := 0; i < 6; i++ {
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("range-1-%d", i),
+			ConversationID: "conv-1",
+			Body:           fmt.Sprintf("range c1 msg %d", i),
+			TimestampMS:    int64(1000 + i*100),
+		}); err != nil {
+			t.Fatalf("seed range conv-1 message %d: %v", i, err)
+		}
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("range-2-%d", i),
+			ConversationID: "conv-2",
+			Body:           fmt.Sprintf("range c2 msg %d", i),
+			TimestampMS:    int64(1050 + i*100),
+		}); err != nil {
+			t.Fatalf("seed range conv-2 message %d: %v", i, err)
+		}
+	}
+
+	got, err := store.GetMessagesByConversationsRange([]string{"conv-1", "conv-2"}, 1200, 1600, 4)
+	if err != nil {
+		t.Fatalf("get range: %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("count: got %d, want 4", len(got))
+	}
+
+	wantIDs := []string{"range-1-4", "range-2-4", "range-1-5", "range-2-5"}
+	for i, want := range wantIDs {
+		if got[i].MessageID != want {
+			t.Fatalf("msg[%d]: got %q, want %q", i, got[i].MessageID, want)
+		}
+	}
+}
+
+func TestGetMessagesByConversationsUsesMessageIDTieBreaker(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, msg := range []*Message{
+		{MessageID: "a", ConversationID: "conv-1", TimestampMS: 1000},
+		{MessageID: "b", ConversationID: "conv-1", TimestampMS: 1000},
+		{MessageID: "c", ConversationID: "conv-1", TimestampMS: 1000},
+	} {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed %s: %v", msg.MessageID, err)
+		}
+	}
+
+	got, err := store.GetMessagesByConversations([]string{"conv-1"}, 2)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("count: got %d, want 2", len(got))
+	}
+	if got[0].MessageID != "b" || got[1].MessageID != "c" {
+		t.Fatalf("got ids [%s %s], want [b c]", got[0].MessageID, got[1].MessageID)
+	}
+}
+
+func TestGetMessagesByConversationsRangeUsesMessageIDTieBreaker(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, msg := range []*Message{
+		{MessageID: "a", ConversationID: "conv-1", TimestampMS: 1000},
+		{MessageID: "b", ConversationID: "conv-1", TimestampMS: 1000},
+		{MessageID: "c", ConversationID: "conv-1", TimestampMS: 1000},
+	} {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed %s: %v", msg.MessageID, err)
+		}
+	}
+
+	got, err := store.GetMessagesByConversationsRange([]string{"conv-1"}, 900, 1100, 2)
+	if err != nil {
+		t.Fatalf("get range: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("count: got %d, want 2", len(got))
+	}
+	if got[0].MessageID != "b" || got[1].MessageID != "c" {
+		t.Fatalf("got ids [%s %s], want [b c]", got[0].MessageID, got[1].MessageID)
+	}
+}
+
+func TestSetMessageTranscript(t *testing.T) {
+	store := newTestStore(t)
+
+	msg := &Message{
+		MessageID:      "audio-1",
+		ConversationID: "conv-1",
+		Body:           "[Voice note]",
+		MediaID:        "media-x",
+		MimeType:       "audio/ogg",
+		TimestampMS:    1700000000000,
+	}
+	if err := store.UpsertMessage(msg); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, err := store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Transcript != "" {
+		t.Errorf("expected empty transcript, got %q", got.Transcript)
+	}
+	if got.TranscribedAtMS != 0 {
+		t.Errorf("expected zero transcribed_at, got %d", got.TranscribedAtMS)
+	}
+
+	firstModel := "faster-whisper:base.en"
+	if err := store.SetMessageTranscript("audio-1", "hello world", &firstModel); err != nil {
+		t.Fatalf("set transcript: %v", err)
+	}
+
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Transcript != "hello world" {
+		t.Errorf("transcript: %q", got.Transcript)
+	}
+	if got.TranscriptModel != "faster-whisper:base.en" {
+		t.Errorf("model: %q", got.TranscriptModel)
+	}
+	if got.TranscribedAtMS == 0 {
+		t.Errorf("expected non-zero transcribed_at")
+	}
+	firstTranscribedAt := got.TranscribedAtMS
+
+	if err := store.UpsertMessage(msg); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Transcript != "hello world" {
+		t.Fatalf("transcript wiped by re-sync — got %q", got.Transcript)
+	}
+
+	updatedModel := "faster-whisper:large-v3"
+	if err := store.SetMessageTranscript("audio-1", "better text", &updatedModel); err != nil {
+		t.Fatalf("set transcript again: %v", err)
+	}
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Transcript != "better text" {
+		t.Errorf("transcript not overwritten: %q", got.Transcript)
+	}
+	if got.TranscriptModel != "faster-whisper:large-v3" {
+		t.Errorf("model not overwritten: %q", got.TranscriptModel)
+	}
+	if got.TranscribedAtMS <= firstTranscribedAt {
+		t.Errorf("expected updated transcribed_at, got %d <= %d", got.TranscribedAtMS, firstTranscribedAt)
+	}
+
+	updatedAt := got.TranscribedAtMS
+	if err := store.SetMessageTranscript("audio-1", "better text", &updatedModel); err != nil {
+		t.Fatalf("idempotent rewrite: %v", err)
+	}
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TranscribedAtMS != updatedAt {
+		t.Errorf("unchanged transcribed_at on identical rewrite: got %d, want %d", got.TranscribedAtMS, updatedAt)
+	}
+
+	if err := store.SetMessageTranscript("audio-1", "updated text without new model", nil); err != nil {
+		t.Fatalf("preserve model when omitted: %v", err)
+	}
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TranscriptModel != "faster-whisper:large-v3" {
+		t.Fatalf("model changed when omitted: got %q, want faster-whisper:large-v3", got.TranscriptModel)
+	}
+
+	clearModel := "faster-whisper:large-v3"
+	if err := store.SetMessageTranscript("audio-1", "", &clearModel); err != nil {
+		t.Fatalf("clear transcript: %v", err)
+	}
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Transcript != "" || got.TranscribedAtMS != 0 || got.TranscriptModel != "" {
+		t.Errorf("expected transcript metadata cleared, got transcript=%q transcribed_at=%d model=%q", got.Transcript, got.TranscribedAtMS, got.TranscriptModel)
+	}
+	if err := store.SetMessageTranscript("audio-1", "", nil); err != nil {
+		t.Fatalf("idempotent clear: %v", err)
+	}
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Transcript != "" || got.TranscribedAtMS != 0 || got.TranscriptModel != "" {
+		t.Errorf("expected cleared transcript metadata after idempotent clear, got transcript=%q transcribed_at=%d model=%q", got.Transcript, got.TranscribedAtMS, got.TranscriptModel)
+	}
+
+	if err := store.SetMessageTranscript("nonexistent", "x", nil); err == nil {
+		t.Errorf("expected error for nonexistent message_id")
+	}
+
+	got, err = store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "[Voice note]" || got.MediaID != "media-x" || got.MimeType != "audio/ogg" {
+		t.Errorf("audio metadata mutated: body=%q media_id=%q mime_type=%q", got.Body, got.MediaID, got.MimeType)
+	}
+}
+
+func TestSetMessageTranscriptRejectsOversizedValues(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "audio-oversized",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-x",
+		MimeType:       "audio/ogg",
+		TimestampMS:    1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tooLongTranscript := strings.Repeat("x", MaxTranscriptBytes+1)
+	if err := store.SetMessageTranscript("audio-oversized", tooLongTranscript, nil); err == nil {
+		t.Fatal("expected oversized transcript error")
+	}
+	tooLongModel := strings.Repeat("m", MaxTranscriptModelBytes+1)
+	if err := store.SetMessageTranscript("audio-oversized", "ok", &tooLongModel); err == nil {
+		t.Fatal("expected oversized model error")
+	}
+}
+
+func TestSearchMessages_Comprehensive(t *testing.T) {
+	store := newTestStore(t)
+
+	msgs := []Message{
+		{MessageID: "s1", SenderNumber: "+1111", Body: "Hello world", TimestampMS: 1000},
+		{MessageID: "s2", SenderNumber: "+2222", Body: "hello there", TimestampMS: 2000},
+		{MessageID: "s3", SenderNumber: "+1111", Body: "HELLO AGAIN", TimestampMS: 3000},
+		{MessageID: "s4", SenderNumber: "+1111", Body: "Goodbye", TimestampMS: 4000},
+		{MessageID: "s5", SenderNumber: "+2222", Body: "Nothing relevant", TimestampMS: 5000},
+	}
+	for i := range msgs {
+		if err := store.UpsertMessage(&msgs[i]); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	t.Run("case insensitive search via LIKE", func(t *testing.T) {
+		// SQLite LIKE is case-insensitive for ASCII by default.
+		got, err := store.SearchMessages("hello", "", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 3 {
+			t.Errorf("count: got %d, want 3", len(got))
+		}
+	})
+
+	t.Run("search with phone number filter", func(t *testing.T) {
+		got, err := store.SearchMessages("hello", "+1111", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("count: got %d, want 2", len(got))
+		}
+	})
+
+	t.Run("search with limit", func(t *testing.T) {
+		got, err := store.SearchMessages("hello", "", 1)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 1 {
+			t.Errorf("count: got %d, want 1", len(got))
+		}
+		// Should return the most recent match (DESC order).
+		if got[0].MessageID != "s3" {
+			t.Errorf("got %q, want s3 (most recent hello)", got[0].MessageID)
+		}
+	})
+
+	t.Run("no results for nonexistent query", func(t *testing.T) {
+		got, err := store.SearchMessages("zzzzz", "", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("count: got %d, want 0", len(got))
+		}
+	})
+
+	t.Run("special characters in search query", func(t *testing.T) {
+		// Insert a message with special characters.
+		store.UpsertMessage(&Message{
+			MessageID:   "s-special",
+			Body:        "Price is $100.00 (50% off!)",
+			TimestampMS: 6000,
+		})
+
+		got, err := store.SearchMessages("$100", "", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 1 {
+			t.Errorf("count: got %d, want 1", len(got))
+		}
+
+		got, err = store.SearchMessages("50%", "", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 1 {
+			t.Errorf("count: got %d, want 1", len(got))
+		}
+	})
+
+	t.Run("search with emoji in body", func(t *testing.T) {
+		store.UpsertMessage(&Message{
+			MessageID:   "s-emoji",
+			Body:        "Great job! 🎉",
+			TimestampMS: 7000,
+		})
+		got, err := store.SearchMessages("🎉", "", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		if len(got) != 1 {
+			t.Errorf("count: got %d, want 1", len(got))
+		}
+	})
+
+	t.Run("partial word match", func(t *testing.T) {
+		got, err := store.SearchMessages("ell", "", 100)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		// Should match "Hello world", "hello there", "HELLO AGAIN".
+		if len(got) != 3 {
+			t.Errorf("count: got %d, want 3", len(got))
+		}
+	})
+}
+
+func TestSearchMessagesStatusOnlyUpsertPreservesFTSBody(t *testing.T) {
+	store := newTestStore(t)
+	if !store.ftsEnabled {
+		t.Skip("fts index not enabled in this sqlite build")
+	}
+	for _, msg := range []Message{
+		{MessageID: "fts-status-1", ConversationID: "c1", Body: "needle alpha", TimestampMS: 1000},
+		{MessageID: "fts-status-2", ConversationID: "c1", Body: "needle beta", TimestampMS: 2000},
+	} {
+		if err := store.UpsertMessage(&msg); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "fts-status-1",
+		ConversationID: "c1",
+		Body:           "",
+		Status:         "OUTGOING_DELIVERED",
+		TimestampMS:    3000,
+	}); err != nil {
+		t.Fatalf("status-only upsert: %v", err)
+	}
+
+	got, err := store.SearchMessages("needle", "", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("search result count = %d, want 2: %#v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, msg := range got {
+		seen[msg.MessageID] = true
+	}
+	if !seen["fts-status-1"] || !seen["fts-status-2"] {
+		t.Fatalf("expected both messages to remain searchable, got %#v", seen)
+	}
+}
+
+func TestGetMessageByID_EdgeCases(t *testing.T) {
+	store := newTestStore(t)
+
+	store.UpsertMessage(&Message{
+		MessageID:      "msg-exists",
+		ConversationID: "c1",
+		Body:           "I exist",
+		TimestampMS:    1000,
+	})
+
+	t.Run("existing message returns correctly", func(t *testing.T) {
+		got, err := store.GetMessageByID("msg-exists")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if got.Body != "I exist" {
+			t.Errorf("body: got %q, want %q", got.Body, "I exist")
+		}
+	})
+
+	t.Run("nonexistent message returns nil without error", func(t *testing.T) {
+		got, err := store.GetMessageByID("does-not-exist")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil, got %+v", got)
+		}
+	})
+
+	t.Run("empty ID returns nil without error", func(t *testing.T) {
+		got, err := store.GetMessageByID("")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil, got %+v", got)
+		}
+	})
+}
+
+func TestDeleteTmpMessages_Comprehensive(t *testing.T) {
+	store := newTestStore(t)
+
+	t.Run("deletes only tmp_ messages in specified conversation", func(t *testing.T) {
+		store.UpsertMessage(&Message{MessageID: "tmp_aaa", ConversationID: "c1", TimestampMS: 1000})
+		store.UpsertMessage(&Message{MessageID: "tmp_bbb", ConversationID: "c1", TimestampMS: 1001})
+		store.UpsertMessage(&Message{MessageID: "real-1", ConversationID: "c1", TimestampMS: 900})
+		store.UpsertMessage(&Message{MessageID: "tmp_ccc", ConversationID: "c2", TimestampMS: 1000})
+
+		n, err := store.DeleteTmpMessages("c1")
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("deleted count: got %d, want 2", n)
+		}
+
+		// c1 should have only the real message.
+		c1Msgs, _ := store.GetMessagesByConversation("c1", 100)
+		if len(c1Msgs) != 1 {
+			t.Fatalf("c1 messages: got %d, want 1", len(c1Msgs))
+		}
+		if c1Msgs[0].MessageID != "real-1" {
+			t.Errorf("remaining message: got %q, want real-1", c1Msgs[0].MessageID)
+		}
+
+		// c2 should be untouched.
+		c2Msgs, _ := store.GetMessagesByConversation("c2", 100)
+		if len(c2Msgs) != 1 {
+			t.Fatalf("c2 messages: got %d, want 1", len(c2Msgs))
+		}
+	})
+
+	t.Run("no tmp_ messages returns zero", func(t *testing.T) {
+		store2 := newTestStore(t)
+		store2.UpsertMessage(&Message{MessageID: "real-only", ConversationID: "c1", TimestampMS: 1000})
+
+		n, err := store2.DeleteTmpMessages("c1")
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("deleted count: got %d, want 0", n)
+		}
+	})
+
+	t.Run("nonexistent conversation returns zero", func(t *testing.T) {
+		store3 := newTestStore(t)
+		n, err := store3.DeleteTmpMessages("no-such-conv")
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("deleted count: got %d, want 0", n)
+		}
+	})
+}
+
+func TestDeleteMessageByID_RemovesSearchIndexEntry(t *testing.T) {
+	store := newTestStore(t)
+	if !store.ftsEnabled {
+		t.Skip("fts index not enabled in this sqlite build")
+	}
+
+	msg := &Message{
+		MessageID:      "msg-delete-me",
+		ConversationID: "c1",
+		Body:           "Price is $100.00 (50% off!)",
+		TimestampMS:    1000,
+	}
+	if err := store.UpsertMessage(msg); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, err := store.SearchMessages("$100", "", 10)
+	if err != nil {
+		t.Fatalf("search before delete: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result before delete, got %d", len(got))
+	}
+
+	if err := store.DeleteMessageByID(msg.MessageID); err != nil {
+		t.Fatalf("delete by id: %v", err)
+	}
+
+	got, err = store.SearchMessages("$100", "", 10)
+	if err != nil {
+		t.Fatalf("search after delete: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 results after delete, got %d", len(got))
+	}
+}
+
+func TestGetMessagesByConversationPaging(t *testing.T) {
+	store := newTestStore(t)
+
+	for i, ts := range []int64{100, 200, 300, 400, 500} {
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("m%d", i+1),
+			ConversationID: "c1",
+			Body:           fmt.Sprintf("msg %d", i+1),
+			TimestampMS:    ts,
+		}); err != nil {
+			t.Fatalf("seed message %d: %v", i+1, err)
+		}
+	}
+
+	before, err := store.GetMessagesByConversationBefore("c1", 400, "m4", 2)
+	if err != nil {
+		t.Fatalf("before query: %v", err)
+	}
+	if len(before) != 2 {
+		t.Fatalf("before count: got %d, want 2", len(before))
+	}
+	if before[0].TimestampMS != 300 || before[1].TimestampMS != 200 {
+		t.Fatalf("before ordering: got [%d %d], want [300 200]", before[0].TimestampMS, before[1].TimestampMS)
+	}
+
+	after, err := store.GetMessagesByConversationAfter("c1", 200, "m2", 2)
+	if err != nil {
+		t.Fatalf("after query: %v", err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("after count: got %d, want 2", len(after))
+	}
+	if after[0].TimestampMS != 300 || after[1].TimestampMS != 400 {
+		t.Fatalf("after ordering: got [%d %d], want [300 400]", after[0].TimestampMS, after[1].TimestampMS)
+	}
+}
+
+func TestGetMessagesByConversationPagingWithDuplicateTimestamps(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, msg := range []*Message{
+		{MessageID: "m1", ConversationID: "c1", Body: "msg 1", TimestampMS: 100},
+		{MessageID: "m2", ConversationID: "c1", Body: "msg 2", TimestampMS: 200},
+		{MessageID: "m3", ConversationID: "c1", Body: "msg 3", TimestampMS: 200},
+		{MessageID: "m4", ConversationID: "c1", Body: "msg 4", TimestampMS: 300},
+	} {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed message %s: %v", msg.MessageID, err)
+		}
+	}
+
+	before, err := store.GetMessagesByConversationBefore("c1", 200, "m3", 10)
+	if err != nil {
+		t.Fatalf("before query: %v", err)
+	}
+	if len(before) != 2 {
+		t.Fatalf("before count: got %d, want 2", len(before))
+	}
+	if before[0].MessageID != "m2" || before[1].MessageID != "m1" {
+		t.Fatalf("before boundary = [%s %s], want [m2 m1]", before[0].MessageID, before[1].MessageID)
+	}
+
+	after, err := store.GetMessagesByConversationAfter("c1", 200, "m2", 10)
+	if err != nil {
+		t.Fatalf("after query: %v", err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("after count: got %d, want 2", len(after))
+	}
+	if after[0].MessageID != "m3" || after[1].MessageID != "m4" {
+		t.Fatalf("after boundary = [%s %s], want [m3 m4]", after[0].MessageID, after[1].MessageID)
+	}
+}
+
+func TestRecordOutgoingMessageDeletesDraftAtomically(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if err := store.UpsertDraft(&Draft{
+		DraftID:        "d1",
+		ConversationID: "c1",
+		Body:           "Draft body",
+		CreatedAt:      200,
+	}); err != nil {
+		t.Fatalf("seed draft: %v", err)
+	}
+
+	msg := &Message{
+		MessageID:      "m-outgoing",
+		ConversationID: "c1",
+		Body:           "Sent body",
+		IsFromMe:       true,
+		TimestampMS:    999,
+		Status:         "OUTGOING_SENDING",
+	}
+	if err := store.RecordOutgoingMessage(msg, "d1"); err != nil {
+		t.Fatalf("record outgoing message: %v", err)
+	}
+
+	got, err := store.GetMessageByID("m-outgoing")
+	if err != nil {
+		t.Fatalf("get outgoing message: %v", err)
+	}
+	if got == nil || got.Body != "Sent body" {
+		t.Fatalf("stored outgoing message = %#v, want body %q", got, "Sent body")
+	}
+
+	draft, err := store.GetDraft("d1")
+	if err != nil {
+		t.Fatalf("get draft: %v", err)
+	}
+	if draft != nil {
+		t.Fatalf("draft still exists after outgoing record: %#v", draft)
+	}
+
+	conv, err := store.GetConversation("c1")
+	if err != nil {
+		t.Fatalf("get conversation: %v", err)
+	}
+	if conv.LastMessageTS != 999 {
+		t.Fatalf("conversation timestamp = %d, want 999", conv.LastMessageTS)
+	}
+}
+
+func TestSearchMessages_FTSFallbackStillFindsSpecialQueries(t *testing.T) {
+	store := newTestStore(t)
+	if !store.ftsEnabled {
+		t.Skip("fts index not enabled in this sqlite build")
+	}
+
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "special-1",
+		ConversationID: "c1",
+		Body:           "Price is $100.00 (50% off!)",
+		TimestampMS:    1000,
+	}); err != nil {
+		t.Fatalf("upsert special chars: %v", err)
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "special-2",
+		ConversationID: "c1",
+		Body:           "Great job! 🎉",
+		TimestampMS:    1001,
+	}); err != nil {
+		t.Fatalf("upsert emoji: %v", err)
+	}
+
+	for _, q := range []string{"$100", "50%", "🎉"} {
+		got, err := store.SearchMessages(q, "", 10)
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("search %q returned %d results, want 1", q, len(got))
+		}
+	}
+}
+
+func TestGetMessages_OrderingIsDescending(t *testing.T) {
+	store := newTestStore(t)
+
+	for i := 0; i < 10; i++ {
+		store.UpsertMessage(&Message{
+			MessageID:   fmt.Sprintf("m%d", i),
+			TimestampMS: int64(i * 1000),
+		})
+	}
+
+	got, err := store.GetMessages("", 0, 0, 100)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].TimestampMS > got[i-1].TimestampMS {
+			t.Errorf("not DESC at index %d: %d > %d", i, got[i].TimestampMS, got[i-1].TimestampMS)
+		}
+	}
+}
+
+func TestUpsertMessage_EmptyBody(t *testing.T) {
+	store := newTestStore(t)
+
+	// Media-only messages can have empty bodies.
+	msg := &Message{
+		MessageID:   "media-only",
+		MediaID:     "mid-1",
+		MimeType:    "video/mp4",
+		Body:        "",
+		TimestampMS: 1000,
+	}
+	if err := store.UpsertMessage(msg); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	got, err := store.GetMessageByID("media-only")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Body != "" {
+		t.Errorf("body: got %q, want empty", got.Body)
+	}
+	if got.MediaID != "mid-1" {
+		t.Errorf("MediaID: got %q, want mid-1", got.MediaID)
+	}
+}
+
+func TestLatestReceivedTimestampIgnoresOutgoing(t *testing.T) {
+	store := newTestStore(t)
+	rows := []*Message{
+		{MessageID: "sig-in-1", TimestampMS: 100, IsFromMe: false, SourcePlatform: "signal", ConversationID: "c1"},
+		{MessageID: "sig-in-2", TimestampMS: 200, IsFromMe: false, SourcePlatform: "signal", ConversationID: "c1"},
+		{MessageID: "sig-out-3", TimestampMS: 300, IsFromMe: true, SourcePlatform: "signal", ConversationID: "c1"},
+	}
+	for _, m := range rows {
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("upsert %s: %v", m.MessageID, err)
+		}
+	}
+	got, err := store.LatestReceivedTimestamp("signal")
+	if err != nil {
+		t.Fatalf("LatestReceivedTimestamp: %v", err)
+	}
+	if got != 200 {
+		t.Fatalf("latest received ts = %d, want 200 (outgoing at 300 should be ignored)", got)
+	}
+	all, _ := store.LatestTimestamp("signal")
+	if all != 300 {
+		t.Fatalf("LatestTimestamp sanity = %d, want 300", all)
+	}
+}
+
+func TestListLegacyWhatsAppMediaPlaceholdersIncludesStickers(t *testing.T) {
+	store := newTestStore(t)
+	rows := []*Message{
+		{
+			MessageID:      "whatsapp:sticker-placeholder",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Sticker]",
+			TimestampMS:    3000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "sticker-placeholder",
+		},
+		{
+			MessageID:      "whatsapp:photo-placeholder",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Photo]",
+			TimestampMS:    2000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "photo-placeholder",
+		},
+		{
+			MessageID:      "whatsapp:sticker-has-media",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Sticker]",
+			TimestampMS:    1000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "sticker-has-media",
+			MediaID:        "wa:already-present",
+		},
+		{
+			MessageID:      "sms:sticker-placeholder",
+			ConversationID: "sms:thread-1",
+			Body:           "[Sticker]",
+			TimestampMS:    4000,
+			SourcePlatform: "sms",
+			SourceID:       "sms-sticker",
+		},
+	}
+	for _, row := range rows {
+		if err := store.UpsertMessage(row); err != nil {
+			t.Fatalf("upsert %s: %v", row.MessageID, err)
+		}
+	}
+
+	got, err := store.ListLegacyWhatsAppMediaPlaceholders(10)
+	if err != nil {
+		t.Fatalf("ListLegacyWhatsAppMediaPlaceholders: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d placeholders, want 2", len(got))
+	}
+	if got[0].MessageID != "whatsapp:sticker-placeholder" {
+		t.Fatalf("first placeholder = %q, want whatsapp:sticker-placeholder", got[0].MessageID)
+	}
+	if got[1].MessageID != "whatsapp:photo-placeholder" {
+		t.Fatalf("second placeholder = %q, want whatsapp:photo-placeholder", got[1].MessageID)
+	}
+}
+
+func TestPlatformStats(t *testing.T) {
+	store := newTestStore(t)
+
+	msgs := []*Message{
+		{MessageID: "s1", ConversationID: "c1", Body: "hi", TimestampMS: 5000, SourcePlatform: "sms", IsFromMe: false},
+		{MessageID: "s2", ConversationID: "c1", Body: "yo", TimestampMS: 9000, SourcePlatform: "sms", IsFromMe: true}, // newest sms, but outgoing
+		{MessageID: "w1", ConversationID: "c2", Body: "hey", TimestampMS: 3000, SourcePlatform: "whatsapp", IsFromMe: false},
+		{MessageID: "u1", ConversationID: "c3", Body: "??", TimestampMS: 7000, SourcePlatform: "", IsFromMe: false}, // blank defaults to sms
+	}
+	for _, m := range msgs {
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("insert %s: %v", m.MessageID, err)
+		}
+	}
+
+	stats, err := store.PlatformStats()
+	if err != nil {
+		t.Fatalf("PlatformStats: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("platform count: got %d, want 2 (%+v)", len(stats), stats)
+	}
+
+	// Ordered by latest activity DESC: sms(9000), whatsapp(3000).
+	if stats[0].Platform != "sms" || stats[1].Platform != "whatsapp" {
+		t.Fatalf("ordering: got %s, %s; want sms, whatsapp",
+			stats[0].Platform, stats[1].Platform)
+	}
+
+	sms := stats[0]
+	if sms.Count != 3 {
+		t.Errorf("sms count: got %d, want 3", sms.Count)
+	}
+	if sms.LatestMS != 9000 {
+		t.Errorf("sms latest: got %d, want 9000", sms.LatestMS)
+	}
+	// Newest sms message is outgoing, so latest *received* must use the next
+	// inbound SMS-row timestamp. This is the gap-masking case the status command
+	// exists to surface.
+	if sms.LatestRecvMS != 7000 {
+		t.Errorf("sms latest received: got %d, want 7000", sms.LatestRecvMS)
+	}
+}
+
+func TestPlatformStats_Empty(t *testing.T) {
+	store := newTestStore(t)
+	stats, err := store.PlatformStats()
+	if err != nil {
+		t.Fatalf("PlatformStats on empty store: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Fatalf("empty store: got %d platforms, want 0", len(stats))
+	}
+}
+
+// Silence detection reads these on daemons whose readers use the legacy store:
+// the newest incoming timestamp, and incoming timestamps inside a window. The
+// app's own outgoing rows, including failed sends, never count.
+func TestIncomingMessageActivityTimestamps(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	msgs := []*Message{
+		{MessageID: "s1", ConversationID: "c1", Body: "a", TimestampMS: 1000, SourcePlatform: "sms"},
+		{MessageID: "s2", ConversationID: "c1", Body: "b", TimestampMS: 3000, SourcePlatform: "sms"},
+		{MessageID: "r1", ConversationID: "c2", Body: "c", TimestampMS: 2000, SourcePlatform: "rcs"},
+		{MessageID: "w1", ConversationID: "c3", Body: "d", TimestampMS: 2500, SourcePlatform: "whatsapp"},
+		// A send Google rejected: stamped now by the app, not delivered.
+		{MessageID: "out1", ConversationID: "c1", Body: "e", TimestampMS: 9000, SourcePlatform: "sms", IsFromMe: true, Status: "OUTGOING_FAILED:FAILURE_2"},
+	}
+	for _, m := range msgs {
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("insert %s: %v", m.MessageID, err)
+		}
+	}
+
+	latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"sms", "rcs"}, 1<<62)
+	if err != nil {
+		t.Fatalf("LatestIncomingMessageTimestamp: %v", err)
+	}
+	if latest != 3000 {
+		t.Fatalf("LatestIncomingMessageTimestamp(sms, rcs) = %d, want 3000 (the failed send at 9000 is not delivery)", latest)
+	}
+	// A row stamped past the bound (a skewed sender clock) is ignored.
+	if latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"sms", "rcs"}, 2500); err != nil || latest != 2000 {
+		t.Fatalf("LatestIncomingMessageTimestamp(sms, rcs, <=2500) = %d, %v; want 2000", latest, err)
+	}
+	if latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"signal"}, 1<<62); err != nil || latest != 0 {
+		t.Fatalf("LatestIncomingMessageTimestamp(signal) = %d, %v; want 0, nil", latest, err)
+	}
+
+	got, err := store.IncomingMessageTimestampsBetween(ctx, []string{"sms", "rcs"}, 1000, 9000)
+	if err != nil {
+		t.Fatalf("IncomingMessageTimestampsBetween: %v", err)
+	}
+	if want := []int64{1000, 2000, 3000}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("IncomingMessageTimestampsBetween = %v, want %v (inclusive, ascending, incoming only)", got, want)
+	}
+	if got, err := store.IncomingMessageTimestampsBetween(ctx, nil, 0, 10000); err != nil || len(got) != 0 {
+		t.Fatalf("IncomingMessageTimestampsBetween(no platforms) = %v, %v; want empty", got, err)
+	}
+	if got, err := store.IncomingMessageTimestampsBetween(ctx, []string{"sms"}, 5000, 1000); err != nil || len(got) != 0 {
+		t.Fatalf("IncomingMessageTimestampsBetween(inverted) = %v, %v; want empty", got, err)
+	}
+}
+
+func TestLatestConversationPreviews(t *testing.T) {
+	store := newTestStore(t)
+
+	msgs := []*Message{
+		{
+			MessageID:      "c1-old",
+			ConversationID: "c1",
+			Body:           "Older received message",
+			TimestampMS:    1000,
+		},
+		{
+			MessageID:      "c1-new",
+			ConversationID: "c1",
+			Body:           "Latest\nsent   message",
+			TimestampMS:    2000,
+			IsFromMe:       true,
+		},
+		{
+			MessageID:      "c2-photo",
+			ConversationID: "c2",
+			TimestampMS:    3000,
+			MediaID:        "media-photo",
+			MimeType:       "image/jpeg",
+		},
+		{
+			MessageID:      "c3-audio",
+			ConversationID: "c3",
+			TimestampMS:    4000,
+			MediaID:        "media-audio",
+			MimeType:       "audio/ogg",
+			IsFromMe:       true,
+		},
+		{
+			MessageID:      "c4-long",
+			ConversationID: "c4",
+			Body:           strings.Repeat("🙂", 160),
+			TimestampMS:    5000,
+		},
+	}
+	for _, msg := range msgs {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("upsert %s: %v", msg.MessageID, err)
+		}
+	}
+
+	previews, err := store.LatestConversationPreviews([]string{"c1", "c2", "c3", "c4", "c1", "", "missing"})
+	if err != nil {
+		t.Fatalf("LatestConversationPreviews: %v", err)
+	}
+
+	if got, want := previews["c1"], "You: Latest sent message"; got != want {
+		t.Fatalf("c1 preview = %q, want %q", got, want)
+	}
+	if got, want := previews["c2"], "Photo"; got != want {
+		t.Fatalf("c2 preview = %q, want %q", got, want)
+	}
+	if got, want := previews["c3"], "You: Audio"; got != want {
+		t.Fatalf("c3 preview = %q, want %q", got, want)
+	}
+	if got := previews["c4"]; len([]rune(got)) != 120 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("c4 preview = %q, want 120 runes ending in ellipsis", got)
+	}
+	if _, ok := previews["missing"]; ok {
+		t.Fatalf("missing conversation should not have a preview: %#v", previews)
+	}
+}
+
+func TestSearchMessagesFiltered_DateWindow(t *testing.T) {
+	store := newTestStore(t)
+	day := int64(24 * 60 * 60 * 1000)
+	base := int64(1_700_000_000_000) // fixed reference instant
+
+	for i := 0; i < 5; i++ { // one "flight" message per day, days 0..4
+		m := &Message{
+			MessageID:      fmt.Sprintf("m%d", i),
+			ConversationID: "c1",
+			SenderName:     "Travel",
+			Body:           fmt.Sprintf("your flight booking %d", i),
+			TimestampMS:    base + int64(i)*day,
+			SourcePlatform: "sms",
+		}
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("insert m%d: %v", i, err)
+		}
+	}
+
+	// Window covering days 1..3 inclusive.
+	got, err := store.SearchMessagesFiltered("flight", SearchFilter{
+		SinceMS: base + 1*day, UntilMS: base + 3*day, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("windowed search: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("windowed search: got %d, want 3", len(got))
+	}
+	for _, m := range got {
+		if m.TimestampMS < base+1*day || m.TimestampMS > base+3*day {
+			t.Errorf("message %s ts %d outside window", m.MessageID, m.TimestampMS)
+		}
+	}
+
+	// Swapped bounds (until < since) are normalized, not treated as empty.
+	swapped, err := store.SearchMessagesFiltered("flight", SearchFilter{
+		SinceMS: base + 3*day, UntilMS: base + 1*day, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("swapped search: %v", err)
+	}
+	if len(swapped) != 3 {
+		t.Errorf("swapped bounds: got %d, want 3", len(swapped))
+	}
+
+	// No bounds → all five; legacy wrapper agrees.
+	all, err := store.SearchMessagesFiltered("flight", SearchFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("unbounded search: %v", err)
+	}
+	if len(all) != 5 {
+		t.Errorf("unbounded: got %d, want 5", len(all))
+	}
+	legacy, err := store.SearchMessages("flight", "", 100)
+	if err != nil {
+		t.Fatalf("legacy search: %v", err)
+	}
+	if len(legacy) != 5 {
+		t.Errorf("legacy wrapper: got %d, want 5", len(legacy))
+	}
+}
+
+func TestSearchMessagesFilteredConversationID(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, convID := range []string{"c1", "c2"} {
+		if err := store.UpsertConversation(&Conversation{ConversationID: convID, Name: convID, LastMessageTS: 100}); err != nil {
+			t.Fatalf("seed conversation %s: %v", convID, err)
+		}
+	}
+	for _, msg := range []*Message{
+		{MessageID: "m1", ConversationID: "c1", Body: "thread needle", TimestampMS: 100},
+		{MessageID: "m2", ConversationID: "c2", Body: "thread needle", TimestampMS: 200},
+	} {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed message %s: %v", msg.MessageID, err)
+		}
+	}
+
+	got, err := store.SearchMessagesFiltered("needle", SearchFilter{ConversationID: "c1", Limit: 10})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d messages, want 1", len(got))
+	}
+	if got[0].ConversationID != "c1" || got[0].MessageID != "m1" {
+		t.Fatalf("got message %s in %s, want m1 in c1", got[0].MessageID, got[0].ConversationID)
+	}
+}
+
+func TestGetMessagesAroundMessage(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: 500}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("m%d", i),
+			ConversationID: "c1",
+			Body:           fmt.Sprintf("message %d", i),
+			TimestampMS:    int64(i * 100),
+		}); err != nil {
+			t.Fatalf("seed message %d: %v", i, err)
+		}
+	}
+
+	got, err := store.GetMessagesAroundMessage("c1", "m3", 2, 1)
+	if err != nil {
+		t.Fatalf("around: %v", err)
+	}
+	wantIDs := []string{"m1", "m2", "m3", "m4"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("got %d messages, want %d", len(got), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if got[i].MessageID != want {
+			t.Fatalf("result %d = %s, want %s", i, got[i].MessageID, want)
+		}
+	}
+
+	if _, err := store.GetMessagesAroundMessage("other", "m3", 1, 1); !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("wrong conversation err = %v, want ErrMessageNotFound", err)
+	}
+}

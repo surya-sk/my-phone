@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>Messages</RootNamespace>
+    <AssemblyTitle>My Phone</AssemblyTitle>
+    <Product>My Phone</Product>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Platforms>x64</Platforms>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Once the sparse identity is registered, the framework comes from Identity\AppxManifest.xml instead. -->
+    <WindowsAppSDKBootstrapAutoInitializeOptions_OnPackageIdentity_NoOp>true</WindowsAppSDKBootstrapAutoInitializeOptions_OnPackageIdentity_NoOp>
+    <!-- Program.cs provides Main so the app can stay single-instance. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+    <Content Include="..\Messages.Backend\openmessage.exe" Link="Backend\openmessage.exe" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\AppIcon.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\AppIcon.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Identity\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The shell may resolve package logos from the external location (the exe folder) too. -->
+    <Content Include="Identity\Assets\*" Link="Assets\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Explorer reads the identity's resource index from the exe folder; without it the taskbar icon is blank.
+         WinUI's own index is Messages.pri, so this name is free. Regenerate with makepri after changing logos. -->
+    <Content Include="Identity\resources.pri" Link="resources.pri" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

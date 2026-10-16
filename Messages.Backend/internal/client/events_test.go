@@ -1,0 +1,559 @@
+package client
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
+	"github.com/maxghenis/openmessage/internal/db"
+)
+
+func TestHandleMessage_RemovesOnlyMatchingTmpPlaceholder(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "tmp_match",
+		ConversationID: "c1",
+		Body:           "pending 1",
+		IsFromMe:       true,
+		TimestampMS:    1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "tmp_other",
+		ConversationID: "c1",
+		Body:           "pending 2",
+		IsFromMe:       true,
+		TimestampMS:    1001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		conversationChanges int
+		messagesChangedFor  string
+	)
+	handler := &EventHandler{
+		Store:  store,
+		Logger: zerolog.Nop(),
+		OnConversationsChange: func() {
+			conversationChanges++
+		},
+		OnMessagesChange: func(conversationID string) {
+			messagesChangedFor = conversationID
+		},
+	}
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "real_msg_1",
+			ConversationID: "c1",
+			Timestamp:      2000 * 1000,
+			TmpID:          "tmp_match",
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     true,
+				FullName: "Me",
+				ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "delivered"},
+				},
+			}},
+		},
+	})
+
+	if got, err := store.GetMessageByID("tmp_match"); err != nil {
+		t.Fatalf("lookup tmp_match: %v", err)
+	} else if got != nil {
+		t.Fatalf("tmp_match should have been removed, got %+v", got)
+	}
+
+	if got, err := store.GetMessageByID("tmp_other"); err != nil {
+		t.Fatalf("lookup tmp_other: %v", err)
+	} else if got == nil {
+		t.Fatal("tmp_other should remain in the store")
+	}
+
+	if got, err := store.GetMessageByID("real_msg_1"); err != nil {
+		t.Fatalf("lookup real message: %v", err)
+	} else if got == nil {
+		t.Fatal("real echoed message should be stored")
+	}
+	if messagesChangedFor != "c1" {
+		t.Fatalf("messages change callback conversation = %q, want c1", messagesChangedFor)
+	}
+	if conversationChanges != 1 {
+		t.Fatalf("conversation change callback count = %d, want 1", conversationChanges)
+	}
+}
+
+func TestHandleMessage_BumpsConversationTimestamp(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := &EventHandler{
+		Store:  store,
+		Logger: zerolog.Nop(),
+	}
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "m1",
+			ConversationID: "c1",
+			Timestamp:      3000 * 1000,
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     false,
+				FullName: "Alice",
+				ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "latest"},
+				},
+			}},
+		},
+	})
+
+	convo, err := store.GetConversation("c1")
+	if err != nil {
+		t.Fatalf("get conversation: %v", err)
+	}
+	if convo.LastMessageTS != 3000 {
+		t.Fatalf("conversation last_message_ts = %d, want 3000", convo.LastMessageTS)
+	}
+}
+
+func TestHandlePingFailed_EndsGenerationAfterThreeConsecutiveFailures(t *testing.T) {
+	var connectionLost, sessionInvalid int
+	handler := &EventHandler{
+		Logger: zerolog.Nop(),
+		OnConnectionLost: func() {
+			connectionLost++
+		},
+		OnSessionInvalid: func() {
+			sessionInvalid++
+		},
+	}
+
+	// libgm supplies the consecutive count; guard the exact threshold before the
+	// Wave 1 supervisor takes ownership of ending a connection generation.
+	for _, errorCount := range []int{1, 2, 3} {
+		handler.Handle(&events.PingFailed{ErrorCount: errorCount})
+		wantConnectionLost := 0
+		if errorCount == 3 {
+			wantConnectionLost = 1
+		}
+		if connectionLost != wantConnectionLost {
+			t.Fatalf("connection-lost callbacks after ErrorCount %d = %d, want %d", errorCount, connectionLost, wantConnectionLost)
+		}
+		if sessionInvalid != 0 {
+			t.Fatalf("session-invalid callbacks after ErrorCount %d = %d, want 0", errorCount, sessionInvalid)
+		}
+	}
+}
+
+func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
+	var reasons []string
+	var phoneResponding []bool
+	var sessionInvalid, connectionLost int
+	handler := &EventHandler{
+		Logger: zerolog.Nop(),
+		OnRealtimeGapRecovered: func(reason string) {
+			reasons = append(reasons, reason)
+		},
+		OnPhoneRespondingChange: func(responding bool) {
+			phoneResponding = append(phoneResponding, responding)
+		},
+		OnSessionInvalid: func() {
+			sessionInvalid++
+		},
+		OnConnectionLost: func() {
+			connectionLost++
+		},
+	}
+
+	handler.Handle(&events.PhoneNotResponding{})
+	// Phone reachability is not credential validity. Keep this distinction when
+	// the Wave 1 supervisor assumes connection-lifecycle ownership.
+	if sessionInvalid != 0 {
+		t.Fatalf("session-invalid callbacks after PhoneNotResponding = %d, want 0", sessionInvalid)
+	}
+	if connectionLost != 0 {
+		t.Fatalf("connection-lost callbacks after PhoneNotResponding = %d, want 0", connectionLost)
+	}
+	handler.Handle(&events.ListenRecovered{})
+	handler.Handle(&events.PhoneRespondingAgain{})
+
+	if len(reasons) != 2 {
+		t.Fatalf("recovery callback count = %d, want 2", len(reasons))
+	}
+	if reasons[0] != "listen_recovered" {
+		t.Fatalf("first recovery reason = %q, want %q", reasons[0], "listen_recovered")
+	}
+	if reasons[1] != "phone_responding_again" {
+		t.Fatalf("second recovery reason = %q, want %q", reasons[1], "phone_responding_again")
+	}
+	if len(phoneResponding) != 2 {
+		t.Fatalf("phone responding callback count = %d, want 2", len(phoneResponding))
+	}
+	if phoneResponding[0] != false || phoneResponding[1] != true {
+		t.Fatalf("phone responding callbacks = %v, want [false true]", phoneResponding)
+	}
+}
+
+func TestMaybePersistRotatedCookies(t *testing.T) {
+	authData := libgm.NewAuthData()
+	authData.SetCookies(map[string]string{"SID": "initial"})
+	gmClient := libgm.NewClient(authData, nil, zerolog.Nop())
+	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	handler := &EventHandler{
+		Logger:              zerolog.Nop(),
+		SessionPath:         sessionPath,
+		Client:              &Client{GM: gmClient, Logger: zerolog.Nop()},
+		Now:                 func() time.Time { return now },
+		PersistCookiesEvery: 5 * time.Minute,
+	}
+
+	handler.Handle(&events.ListenRecovered{})
+	assertSavedCookie := func(want string) {
+		t.Helper()
+		sessionData, err := LoadSession(sessionPath)
+		if err != nil {
+			t.Fatalf("LoadSession(): %v", err)
+		}
+		var savedAuth struct {
+			Cookies map[string]string `json:"cookies"`
+		}
+		if err := json.Unmarshal(sessionData.AuthDataJSON, &savedAuth); err != nil {
+			t.Fatalf("unmarshal saved auth data: %v", err)
+		}
+		if savedAuth.Cookies["SID"] != want {
+			t.Fatalf("saved SID = %q, want %q", savedAuth.Cookies["SID"], want)
+		}
+	}
+	assertSavedCookie("initial")
+
+	firstSentinel := time.Unix(1, 0)
+	if err := os.Chtimes(sessionPath, firstSentinel, firstSentinel); err != nil {
+		t.Fatalf("set first sentinel mtime: %v", err)
+	}
+	now = now.Add(time.Minute)
+	handler.Handle(&events.ListenRecovered{})
+	info, err := os.Stat(sessionPath)
+	if err != nil {
+		t.Fatalf("stat throttled session: %v", err)
+	}
+	if !info.ModTime().Equal(firstSentinel) {
+		t.Fatalf("throttled event rewrote session: mtime = %v, want %v", info.ModTime(), firstSentinel)
+	}
+
+	authData.SetCookies(map[string]string{"SID": "rotated"})
+	now = now.Add(5 * time.Minute)
+	handler.Handle(&events.ListenRecovered{})
+	assertSavedCookie("rotated")
+	info, err = os.Stat(sessionPath)
+	if err != nil {
+		t.Fatalf("stat rotated session: %v", err)
+	}
+	if info.ModTime().Equal(firstSentinel) {
+		t.Fatal("changed cookies did not rewrite session after throttle window")
+	}
+
+	secondSentinel := time.Unix(2, 0)
+	if err := os.Chtimes(sessionPath, secondSentinel, secondSentinel); err != nil {
+		t.Fatalf("set second sentinel mtime: %v", err)
+	}
+	now = now.Add(6 * time.Minute)
+	handler.Handle(&events.ListenRecovered{})
+	info, err = os.Stat(sessionPath)
+	if err != nil {
+		t.Fatalf("stat unchanged session: %v", err)
+	}
+	if !info.ModTime().Equal(secondSentinel) {
+		t.Fatalf("unchanged cookies rewrote session: mtime = %v, want %v", info.ModTime(), secondSentinel)
+	}
+}
+
+// A failed cookie save must retry well before the full persist interval (a
+// transient failure should not cost ~5 minutes of durability) while still
+// being throttled, and must leave the change-detect hash alone so the pending
+// rotation is not silently dropped.
+func TestMaybePersistRotatedCookiesRetriesFailedSave(t *testing.T) {
+	authData := libgm.NewAuthData()
+	authData.SetCookies(map[string]string{"SID": "initial"})
+	gmClient := libgm.NewClient(authData, nil, zerolog.Nop())
+	now := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+
+	// A regular file where the session's parent directory belongs makes every
+	// save fail with ENOTDIR, deterministically and without depending on file
+	// permissions (which root would ignore). Removing it lets a retry succeed.
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocked")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	sessionPath := filepath.Join(blocker, "session.json")
+
+	const interval = 5 * time.Minute
+	retryAfter := interval / cookieSaveRetryDivisor
+	var logs strings.Builder
+	handler := &EventHandler{
+		Logger:              zerolog.New(&logs),
+		SessionPath:         sessionPath,
+		Client:              &Client{GM: gmClient, Logger: zerolog.Nop()},
+		Now:                 func() time.Time { return now },
+		PersistCookiesEvery: interval,
+	}
+	saveAttempts := func() int {
+		return strings.Count(logs.String(), "Failed to persist rotated Google cookies")
+	}
+
+	handler.Handle(&events.ListenRecovered{})
+	if got := saveAttempts(); got != 1 {
+		t.Fatalf("failed save attempts after first event = %d, want 1", got)
+	}
+
+	// Still inside the shortened window: a retry must not fire per event.
+	now = now.Add(retryAfter / 2)
+	handler.Handle(&events.ListenRecovered{})
+	if got := saveAttempts(); got != 1 {
+		t.Fatalf("failed save attempts inside retry window = %d, want 1", got)
+	}
+
+	// The shortened window has elapsed, far short of the full interval.
+	now = now.Add(retryAfter / 2)
+	handler.Handle(&events.ListenRecovered{})
+	if got := saveAttempts(); got != 2 {
+		t.Fatalf("failed save attempts after retry window = %d, want 2", got)
+	}
+
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("clear blocker: %v", err)
+	}
+	now = now.Add(retryAfter)
+	handler.Handle(&events.ListenRecovered{})
+	sessionData, err := LoadSession(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadSession() after recovered save: %v", err)
+	}
+	var savedAuth struct {
+		Cookies map[string]string `json:"cookies"`
+	}
+	if err := json.Unmarshal(sessionData.AuthDataJSON, &savedAuth); err != nil {
+		t.Fatalf("unmarshal saved auth data: %v", err)
+	}
+	// The failures must not have recorded the cookie hash; otherwise this save
+	// would have been skipped as "unchanged" and the rotation lost.
+	if savedAuth.Cookies["SID"] != "initial" {
+		t.Fatalf("saved SID = %q, want %q", savedAuth.Cookies["SID"], "initial")
+	}
+}
+
+func TestHandleMessage_NotifiesOnlyFreshIncomingMessages(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &EventHandler{
+		Store:  store,
+		Logger: zerolog.Nop(),
+	}
+
+	var notified []*db.Message
+	handler.OnIncomingMessage = func(message *db.Message) {
+		notified = append(notified, message)
+	}
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "incoming-live",
+			ConversationID: "c1",
+			Timestamp:      1000 * 1000,
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     false,
+				FullName: "Alice",
+				ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "live"},
+				},
+			}},
+		},
+	})
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		IsOld: true,
+		Message: &gmproto.Message{
+			MessageID:      "incoming-old",
+			ConversationID: "c1",
+			Timestamp:      2000 * 1000,
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     false,
+				FullName: "Alice",
+				ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "old"},
+				},
+			}},
+		},
+	})
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "outgoing-live",
+			ConversationID: "c1",
+			Timestamp:      3000 * 1000,
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     true,
+				FullName: "Me",
+				ID:       &gmproto.SmallInfo{Number: "+15550001111"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "outgoing"},
+				},
+			}},
+		},
+	})
+
+	if len(notified) != 1 {
+		t.Fatalf("incoming notification count = %d, want 1", len(notified))
+	}
+	if notified[0].MessageID != "incoming-live" {
+		t.Fatalf("incoming notification message_id = %q, want %q", notified[0].MessageID, "incoming-live")
+	}
+}
+
+func TestHandleMessage_SchedulesPendingMediaRefreshForUndownloadedMMS(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &EventHandler{
+		Store:  store,
+		Logger: zerolog.Nop(),
+	}
+
+	var got struct {
+		conversationID string
+		messageID      string
+	}
+	handler.OnPendingMedia = func(conversationID, messageID string) {
+		got.conversationID = conversationID
+		got.messageID = messageID
+	}
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "incoming-mms",
+			ConversationID: "c1",
+			Timestamp:      1000 * 1000,
+			Type:           3,
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     false,
+				FullName: "Alice",
+				ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "Image from phone"},
+				},
+			}},
+		},
+	})
+
+	if got.conversationID != "c1" {
+		t.Fatalf("conversationID = %q, want c1", got.conversationID)
+	}
+	if got.messageID != "incoming-mms" {
+		t.Fatalf("messageID = %q, want incoming-mms", got.messageID)
+	}
+}
+
+func TestHandleTyping_ResolvesParticipantName(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Weekend Hiking Group",
+		IsGroup:        true,
+		Participants:   `[{"name":"Alice","number":"+15551234567"},{"name":"Me","number":"+15550001111","is_me":true}]`,
+		LastMessageTS:  1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := &EventHandler{
+		Store:  store,
+		Logger: zerolog.Nop(),
+	}
+
+	var got struct {
+		conversationID string
+		senderName     string
+		senderNumber   string
+		typing         bool
+	}
+	handler.OnTypingChange = func(conversationID, senderName, senderNumber string, typing bool) {
+		got.conversationID = conversationID
+		got.senderName = senderName
+		got.senderNumber = senderNumber
+		got.typing = typing
+	}
+
+	handler.Handle(&gmproto.TypingData{
+		ConversationID: "c1",
+		User:           &gmproto.User{Number: "+15551234567"},
+		Type:           gmproto.TypingTypes_STARTED_TYPING,
+	})
+
+	if got.conversationID != "c1" {
+		t.Fatalf("conversationID = %q, want c1", got.conversationID)
+	}
+	if got.senderName != "Alice" {
+		t.Fatalf("senderName = %q, want Alice", got.senderName)
+	}
+	if got.senderNumber != "+15551234567" {
+		t.Fatalf("senderNumber = %q, want +15551234567", got.senderNumber)
+	}
+	if !got.typing {
+		t.Fatal("typing = false, want true")
+	}
+}
