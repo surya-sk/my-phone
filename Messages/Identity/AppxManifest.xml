@@ -12,8 +12,9 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
-  IgnorableNamespaces="uap uap10 rescap desktop com">
-  <Identity Name="NativeMessages.App" Publisher="CN=NativeMessages" Version="1.0.0.0" ProcessorArchitecture="x64" />
+  xmlns:uap13="http://schemas.microsoft.com/appx/manifest/uap/windows10/13"
+  IgnorableNamespaces="uap uap10 rescap desktop com uap13">
+  <Identity Name="NativeMessages.App" Publisher="CN=NativeMessages" Version="1.4.0.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>My Phone</DisplayName>
     <PublisherDisplayName>My Phone</PublisherDisplayName>
@@ -29,14 +30,25 @@
     <Resource Language="en-us" />
   </Resources>
   <Capabilities>
+    <uap:Capability Name="phoneCall" />
     <rescap:Capability Name="runFullTrust" />
+    <!-- Let the app take the Bluetooth hands-free role so phone calls ring, play and dial on this PC
+         (the same set Phone Link and Sefirah declare). Windows answers DeniedBySystem while another app
+         already holds the role for the phone; removing and re-pairing the phone releases it. -->
+    <rescap:Capability Name="phoneLineTransportManagement" />
+    <rescap:Capability Name="phoneCallSystem" />
+    <DeviceCapability Name="bluetooth" />
+    <DeviceCapability Name="microphone" />
+    <DeviceCapability Name="radios" />
   </Capabilities>
   <Applications>
     <Application Id="Messages" Executable="Messages.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
-      <uap:VisualElements DisplayName="My Phone" Description="Google Messages for Windows"
+      <uap:VisualElements DisplayName="My Phone" Description="Calls and messages from your phone"
                           BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png"
                           Square44x44Logo="Assets\Square44x44Logo.png" />
       <Extensions>
+        <!-- Windows 11 grants the Bluetooth calls role only to apps that declare they handle phone calls. -->
+        <uap13:Extension Category="windows.phoneCallActivation" />
         <!-- With identity, toast activation must be declared here instead of registered at runtime. -->
         <com:Extension Category="windows.comServer">
           <com:ComServer>

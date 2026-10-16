@@ -40,6 +40,30 @@ public sealed class BackendHost : IDisposable
         if (!HasSession) throw new InvalidOperationException("Pairing finished without a saved session.");
     }
 
+    /// <summary>Pairs by QR code: Google Messages on the phone scans it under Device pairing. The backend
+    /// prints a fresh pairing URL about every 30 seconds; each one is passed to <paramref name="onCode"/>.</summary>
+    public async Task PairWithQrAsync(Action<string> onCode, CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(ExecutablePath)) throw new FileNotFoundException("RCS backend is missing", ExecutablePath);
+        Directory.CreateDirectory(DataDirectory);
+        using var process = CreateProcess("pair");
+        if (!process.Start()) throw new InvalidOperationException("Could not start pairing.");
+        ChildProcessJob.Attach(process);
+        process.StandardInput.Close();
+        using var kill = cancellationToken.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } });
+        var errorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+        while (await process.StandardOutput.ReadLineAsync(CancellationToken.None) is { } line)
+            if (line.StartsWith("URL: ", StringComparison.Ordinal)) onCode(line[5..].Trim());
+        await process.WaitForExitAsync(CancellationToken.None);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(LastLine(await errorTask) ?? "Pairing stopped.");
+        if (!HasSession) throw new InvalidOperationException("Pairing finished without a saved session.");
+    }
+
+    private static string? LastLine(string text) =>
+        text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault();
+
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         if (!File.Exists(ExecutablePath)) throw new FileNotFoundException("RCS backend is missing", ExecutablePath);

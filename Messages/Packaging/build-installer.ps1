@@ -1,8 +1,9 @@
 # Builds dist\MyPhone.zip: extract on another Windows 10/11 x64 PC and run Install.ps1.
-#   powershell -ExecutionPolicy Bypass -File Messages\Packaging\build-installer.ps1 [-Version 1.0.0]
+#   powershell -ExecutionPolicy Bypass -File Messages\Packaging\build-installer.ps1 [-Version 1.4.0]
+# Without -Version, the version comes from Identity\AppxManifest.xml.
 # The identity package is signed with a self-signed certificate kept in your CurrentUser\My store
 # (created on first run). Only its public .cer ships in the installer.
-param([string]$Version = '1.0.0')
+param([string]$Version)
 $ErrorActionPreference = 'Stop'
 
 $project = Split-Path $PSScriptRoot -Parent                     # ...\Messages
@@ -18,6 +19,10 @@ $kits = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory |
     Where-Object { Test-Path (Join-Path $_.FullName 'x64\makeappx.exe') } | Sort-Object Name | Select-Object -Last 1
 if (-not $kits) { throw 'Windows SDK tools (makeappx, makepri, signtool) not found.' }
 $tools = Join-Path $kits.FullName 'x64'
+if (-not $Version) {
+    [xml]$identityManifest = Get-Content (Join-Path $project 'Identity\AppxManifest.xml')
+    $Version = ([version]$identityManifest.Package.Identity.Version).ToString(3)
+}
 $packageVersion = "$Version.0"
 $subject = 'CN=NativeMessages'   # Must match Identity\AppxManifest.xml Publisher and app.manifest.
 
@@ -33,7 +38,7 @@ if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
 if (-not (Test-Path (Join-Path $app 'Backend\openmessage.exe'))) { throw 'Backend\openmessage.exe missing from publish output.' }
 # Unpackaged WinUI publish leaves out the compiled XAML (.xbf) and Messages.pri, without which the
 # window can't load (Microsoft.UI.Xaml.dll fails fast, 0xC000027B). Copy them from the publish build.
-$built = Join-Path $build 'x64\Release\net8.0-windows10.0.19041.0\win-x64'
+$built = Join-Path $build 'x64\Release\net8.0-windows10.0.26100.0\win-x64'
 if (-not (Test-Path $built)) { throw "Publish build output not found: $built" }
 Get-ChildItem $built -Recurse -Include *.xbf, Messages.pri | ForEach-Object {
     $relative = $_.FullName.Substring($built.Length + 1)
@@ -41,7 +46,7 @@ Get-ChildItem $built -Recurse -Include *.xbf, Messages.pri | ForEach-Object {
     New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
     Copy-Item $_.FullName $destination -Force
 }
-foreach ($required in 'App.xbf', 'MainWindow.xbf', 'Themes\Metro.xbf', 'Messages.pri') {
+foreach ($required in 'App.xbf', 'MainWindow.xbf', 'Themes\Metro.xbf', 'Views\CallsView.xbf', 'Messages.pri') {
     if (-not (Test-Path (Join-Path $app $required))) { throw "$required missing from the app payload." }
 }
 
@@ -95,21 +100,37 @@ Copy-Item (Join-Path $PSScriptRoot 'Install.ps1'), (Join-Path $PSScriptRoot 'Uni
 @'
 My Phone for Windows (x64)
 
-Requires Windows 10 version 2004 (build 19041) or newer and an Android phone
-running Google Messages. Windows does not need a SIM. The phone must remain online.
+Texts (RCS and SMS) and phone calls from your Android phone, on your PC.
 
-1. Extract the entire ZIP to a folder on the other PC.
-2. Open PowerShell in that extracted folder and run:
+Requirements
+- Windows 10 version 2004 or newer for messages. Windows 11 for calls.
+- An Android phone with Google Messages as its texting app.
+- For calls: a PC with Bluetooth.
+
+Install
+1. Extract the entire ZIP to a folder.
+2. Right-click Install.ps1 > Run with PowerShell. Or open PowerShell in the folder and run:
      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
-3. Accept the Windows administrator prompt to trust the included app signing
-   certificate. This enables the Start menu entry, notifications and taskbar badge.
-4. The app launches. Pair it with your phone using the on-screen instructions.
+3. Accept the administrator prompt. It trusts the included signing certificate so
+   Windows gives the app its Start entry, notifications, taskbar badge and calling.
+4. My Phone starts.
 
-The ZIP includes the app, its local backend, .NET, and Windows App Runtime.
-No existing account session or messages are included. The app installs for the
-current Windows user in %LOCALAPPDATA%\Programs\Messages.
+Set up messages
+- On the phone: Google Messages > profile picture > Device pairing > QR code scanner,
+  then scan the code My Phone shows.
 
-To remove it, use Windows Settings > Apps > Installed apps > My Phone.
+Set up calls
+- Pair the phone with the PC in Settings > Bluetooth & devices > Add device.
+- In My Phone choose calls, then pick your phone. Allow the requests on the phone
+  (calls, contacts and call history).
+- Windows lets one app handle calls per phone. If Phone Link (or another app) already
+  does, remove the phone in Bluetooth settings, pair it again, then pick it in My Phone.
+
+The ZIP includes the app, its local backend, .NET and the Windows App Runtime.
+No account, messages or contacts are included. The app installs for the current
+Windows user in %LOCALAPPDATA%\Programs\Messages.
+
+To remove it: Settings > Apps > Installed apps > My Phone > Uninstall.
 '@ | Set-Content -LiteralPath (Join-Path $stage 'setup\README.txt') -Encoding UTF8
 
 Write-Host '6/6 Creating dist\MyPhone.zip...'

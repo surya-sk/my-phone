@@ -30,10 +30,10 @@ This is a native WinUI 3 Windows client for Google Messages. The user wants a pr
 ## Runtime and build
 
 - The WinUI app is .NET 8, Windows App SDK 2.2.0, `WindowsPackageType=None`, x64. Use Visual Studio's **Unpackaged** launch profile.
-- The Go backend is built from `Messages.Backend` (Go 1.25) as `openmessage.exe`. The WinUI project copies that executable into `Messages/bin/x64/Release/net8.0-windows10.0.19041.0/Backend/`.
+- The Go backend is built from `Messages.Backend` (Go 1.25) as `openmessage.exe`. The WinUI project copies that executable into `Messages/bin/x64/Release/net8.0-windows10.0.26100.0/Backend/`.
 - From the project root, build with `dotnet build MessagesClient.sln --no-restore -c Release -p:Platform=x64`. If dependencies are not restored yet, restore the solution first.
 - To rebuild the backend from `Messages.Backend`, run `../Messages.Tools/go/bin/go.exe build -buildvcs=false -o openmessage.exe .` (adjust path separators for the shell). Then rebuild the WinUI solution so the new executable is copied.
-- Run `Messages/bin/x64/Release/net8.0-windows10.0.19041.0/Messages.exe` or F5 in Visual Studio. The last Release build on 2026-10-12 succeeded with zero warnings and zero errors. This confirms compilation, **not** live phone behavior.
+- Run `Messages/bin/x64/Release/net8.0-windows10.0.26100.0/Messages.exe` or F5 in Visual Studio. The last Release build on 2026-10-12 succeeded with zero warnings and zero errors. This confirms compilation, **not** live phone behavior.
 - `BackendHost` launches `openmessage.exe serve` on `127.0.0.1:17077` when the app opens a paired session and kills its child process when the window closes. It launches `openmessage.exe pair --google-stdin` for pairing. Session and bearer token live in `%LOCALAPPDATA%\NativeMessages` (`session.json` and `control.token`). Do not commit or print those files.
 
 ## Pairing and data flow
@@ -88,6 +88,37 @@ Google Messages delivers live messages to **one** linked session at a time, even
 - Timeout and inactivity deactivations are reclaimed automatically. A takeover by another device is not, so two PCs don't keep stealing from each other.
 - `POST /api/google/activate` calls libgm `SetActiveSession` (the web client's "Use here"), paced to once a minute, and then runs a recent reconcile.
 - The app shows "active on another device" with a **use here** banner, activates when its window is focused (at most every 2 minutes), and Refresh also activates before requesting a phone sync (`POST /api/backfill {since}`).
+
+### Calls (2026-10-16)
+
+Calls use Bluetooth only. There is no Android companion app.
+- **Hands-free role** (`Services/PhoneCalls.cs`). The app takes the phone's role as a Bluetooth hands-free device. It calls `PhoneLineTransportDevice.RequestAccessAsync`, then `RegisterApp`, then `ConnectAsync`.
+  - Windows then sends call audio through the PC's speakers and microphone.
+  - The phone line comes from a `PhoneLineWatcher`, matched by `TransportDeviceId`. Calls in progress are `PhoneCall` objects: answer, decline, end, mute, hold, keypad tones, and moving audio between PC and phone.
+- **Limited Access Feature.** `phonelinetransportdevice_v1` is unlocked with the community feature key that Sefirah also uses (`LimitedAccess` in the same file). The token is derived at run time from the package family name.
+- **Manifest** (`Identity/AppxManifest.xml`). It declares `phoneCall`, `phoneLineTransportManagement`, `phoneCallSystem`, and `uap13:windows.phoneCallActivation`.
+- **`DeniedBySystem` means another app holds the role for that phone.** Phone Link holding it is what happened here. Remove the phone in Bluetooth settings, pair it again, then pick it in the app. It was not a missing token or capability.
+- **Recent calls and contacts** (`Services/Phonebook.cs`). They come over Bluetooth PBAP: a minimal OBEX client on RFCOMM that pulls `telecom/cch.vcf` and `telecom/pb.vcf` (vCard 2.1, with a property mask that includes PHOTO).
+  - Android asks on the phone once per PC and gives up after about 30 seconds.
+  - Results are cached in `%LOCALAPPDATA%\NativeMessages\phonebook.json`.
+- **Notifications.** Incoming calls get a ringing toast (`AppNotificationScenario.IncomingCall`) with Answer, Decline and Message, removed when ringing stops. Missed calls get a toast with Call back and Message.
+- **Screen.** `Views/CallsView.xaml(.cs)` holds recent, missed and contacts, the dial pad, the in-call screen, and setup.
+
+### UI conventions
+
+- **Sections.** Messages and calls are Metro pivot headers. Their filters are a second, smaller pivot row.
+- **Commands.** Each list's commands are in the Metro app bar at the bottom of the pane (`MetroAppBarButtonStyle`), not in the header.
+- **Swipes** (`Controls/SwipeGesture.cs`):
+  - On the headers and filters, a touch or pen swipe moves through filters and on into the other section. A two-finger touchpad swipe works anywhere on the list pane.
+  - Conversation rows: swipe right marks read, swipe left archives. Call rows: swipe right calls, swipe left texts.
+  - In the one-column layout, swiping right on a conversation or contact goes back.
+- **Icon.** The icon set is generated, phone-shaped. The generator script is not in the repo.
+
+### Distribution
+
+- Run `powershell -ExecutionPolicy Bypass -File Messages\Packaging\build-installer.ps1`. It writes `dist\MyPhone.zip`, versioned from `Identity\AppxManifest.xml`.
+- The zip has `Install.ps1`, `Uninstall.ps1`, `README.txt` for end users, the signed identity package, and the Windows App Runtime.
+- The signing certificate is self-signed and stays in the builder's CurrentUser\My store. Only the `.cer` ships.
 
 ### Known gaps
 

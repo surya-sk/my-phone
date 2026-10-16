@@ -61,6 +61,13 @@ public partial class App : Application
     private void Dispatch(AppNotificationActivatedEventArgs args)
     {
         if (_window is null) return;
+        if (args.Arguments.TryGetValue("number", out var number))
+        {
+            args.Arguments.TryGetValue("action", out var callAction);
+            args.Arguments.TryGetValue("callId", out var callId);
+            _window.HandleCallNotification(callAction ?? "", number, callId ?? "");
+            return;
+        }
         if (!args.Arguments.TryGetValue("conversationId", out var id) || string.IsNullOrWhiteSpace(id))
         {
             _window.BringToFront();
@@ -95,6 +102,60 @@ public partial class App : Application
             var notification = builder.BuildNotification();
             AppNotificationManager.Default.Show(notification);
             Log.Write($"Toast shown (id {notification.Id}).");
+        }
+        catch (Exception ex) { Log.Write($"Notification failed: {ex}"); }
+    }
+
+    /// <summary>A ringing call: rings like a phone (IncomingCall scenario) until answered, declined or missed.</summary>
+    internal void ShowIncomingCallToast(string callId, string name, string number, Uri? photo)
+    {
+        if (!_notificationsRegistered) return;
+        try
+        {
+            var builder = new AppNotificationBuilder()
+                .SetScenario(AppNotificationScenario.IncomingCall)
+                .SetTag(ShortHash(callId))
+                .SetGroup("calls")
+                .AddArgument("action", "open")
+                .AddArgument("number", number)
+                .AddArgument("callId", callId)
+                .AddText(string.IsNullOrWhiteSpace(name) ? (number.Length > 0 ? number : "Unknown caller") : name)
+                .AddText(string.IsNullOrWhiteSpace(name) || name == number ? "Incoming call" : $"Incoming call · {number}");
+            if (photo is not null) builder.SetAppLogoOverride(photo, AppNotificationImageCrop.Circle);
+            builder.AddButton(new AppNotificationButton("Answer").SetButtonStyle(AppNotificationButtonStyle.Success)
+                    .AddArgument("action", "answer").AddArgument("number", number).AddArgument("callId", callId))
+                .AddButton(new AppNotificationButton("Decline").SetButtonStyle(AppNotificationButtonStyle.Critical)
+                    .AddArgument("action", "decline").AddArgument("number", number).AddArgument("callId", callId));
+            if (number.Length > 0)
+                builder.AddButton(new AppNotificationButton("Message")
+                    .AddArgument("action", "decline-text").AddArgument("number", number).AddArgument("callId", callId));
+            AppNotificationManager.Default.Show(builder.BuildNotification());
+        }
+        catch (Exception ex) { Log.Write($"Call notification failed: {ex}"); }
+    }
+
+    internal void RemoveCallToast(string callId)
+    {
+        if (!_notificationsRegistered) return;
+        try { _ = AppNotificationManager.Default.RemoveByTagAndGroupAsync(ShortHash(callId), "calls"); }
+        catch (Exception ex) { Log.Write($"Clearing call notification failed: {ex}"); }
+    }
+
+    internal void ShowMissedCallToast(string name, string number)
+    {
+        if (!_notificationsRegistered) return;
+        try
+        {
+            var builder = new AppNotificationBuilder()
+                .AddArgument("action", "open")
+                .AddArgument("number", number)
+                .SetGroup("missed-calls")
+                .AddText("Missed call")
+                .AddText(string.IsNullOrWhiteSpace(name) ? (number.Length > 0 ? number : "Unknown caller") : name);
+            if (number.Length > 0)
+                builder.AddButton(new AppNotificationButton("Call back").AddArgument("action", "call").AddArgument("number", number))
+                       .AddButton(new AppNotificationButton("Message").AddArgument("action", "text").AddArgument("number", number));
+            AppNotificationManager.Default.Show(builder.BuildNotification());
         }
         catch (Exception ex) { Log.Write($"Notification failed: {ex}"); }
     }

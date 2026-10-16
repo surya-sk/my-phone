@@ -3,6 +3,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:models="using:Messages.Models"
     xmlns:controls="using:Messages.Controls"
+    xmlns:views="using:Messages.Views"
     Title="My Phone">
     <Window.SystemBackdrop><MicaBackdrop /></Window.SystemBackdrop>
 
@@ -10,6 +11,21 @@
         <Grid.Resources>
             <!-- ===== Inbox rows ===== -->
             <DataTemplate x:Key="ConversationTemplate" x:DataType="models:ConversationItem">
+                <SwipeControl>
+                <SwipeControl.LeftItems>
+                    <SwipeItems Mode="Execute">
+                        <SwipeItem Text="read" Background="{ThemeResource MetroAccentBrush}" Foreground="White" Invoked="SwipeRead_Invoked">
+                            <SwipeItem.IconSource><FontIconSource Glyph="&#xE8C3;" /></SwipeItem.IconSource>
+                        </SwipeItem>
+                    </SwipeItems>
+                </SwipeControl.LeftItems>
+                <SwipeControl.RightItems>
+                    <SwipeItems Mode="Execute">
+                        <SwipeItem Text="archive" Background="#FF339933" Foreground="White" Invoked="SwipeArchive_Invoked">
+                            <SwipeItem.IconSource><FontIconSource Glyph="&#xE7B8;" /></SwipeItem.IconSource>
+                        </SwipeItem>
+                    </SwipeItems>
+                </SwipeControl.RightItems>
                 <Grid Height="76" Padding="24,0,20,0" ColumnSpacing="14" Background="Transparent"
                       ContextRequested="Conversation_ContextRequested"
                       AutomationProperties.Name="{x:Bind AutomationName, Mode=OneWay}">
@@ -46,6 +62,7 @@
                         </Border>
                     </StackPanel>
                 </Grid>
+                </SwipeControl>
             </DataTemplate>
 
             <DataTemplate x:Key="SectionHeaderTemplate" x:DataType="models:SectionHeaderItem">
@@ -348,6 +365,7 @@
 
         <Grid.RowDefinitions>
             <RowDefinition Height="38" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
@@ -363,13 +381,37 @@
         </Grid>
 
         <!-- ===== Pairing ===== -->
-        <ScrollViewer x:Name="PairingPanel" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <ScrollViewer x:Name="PairingPanel" Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
             <StackPanel MaxWidth="760" HorizontalAlignment="Left" Margin="56,24,40,40" Spacing="22">
                 <StackPanel Spacing="10">
                     <TextBlock Text="connect your phone" Style="{StaticResource MetroHeaderText}" FontSize="52" LineHeight="56" />
-                    <TextBlock Text="Pair with Google Messages using your Google account. Your Android phone stays the device that sends RCS and SMS."
+                    <TextBlock Text="Scan a code with Google Messages on your phone. Your phone keeps sending RCS and SMS; this PC shows them."
                                TextWrapping="Wrap" FontSize="16" Opacity="0.72" />
                 </StackPanel>
+                <Grid x:Name="QrPairingPanel" ColumnSpacing="32" RowSpacing="18">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <!-- Scanners need dark modules on a light field, so the code keeps a white plate in both themes. -->
+                    <Grid Width="248" Height="248" Background="White" Padding="14" VerticalAlignment="Top">
+                        <Image x:Name="QrImage" Stretch="Uniform" AutomationProperties.Name="Pairing QR code" />
+                        <ProgressRing x:Name="QrProgress" IsActive="False" Width="36" Height="36" Foreground="#FF1F1F1F" />
+                        <Button x:Name="QrRetry" Content="show a new code" Click="QrRetry_Click" Visibility="Collapsed"
+                                HorizontalAlignment="Center" VerticalAlignment="Center" RequestedTheme="Light" />
+                    </Grid>
+                    <StackPanel Grid.Column="1" Spacing="14" VerticalAlignment="Top">
+                        <ItemsControl x:Name="QrSteps" IsTabStop="False">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate><StackPanel Spacing="14" /></ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                        <TextBlock x:Name="QrStatus" TextWrapping="Wrap" Opacity="0.72" />
+                        <HyperlinkButton Content="use my Google account instead" Click="ShowAccountPairing_Click" Padding="0" />
+                    </StackPanel>
+                </Grid>
+                <StackPanel x:Name="AccountPairingPanel" Spacing="22" Visibility="Collapsed">
+                <HyperlinkButton Content="scan a QR code instead" Click="ShowQrPairing_Click" Padding="0" />
                 <ItemsControl x:Name="PairingSteps" IsTabStop="False">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate><StackPanel Spacing="14" /></ItemsPanelTemplate>
@@ -406,11 +448,12 @@
                 <TextBlock x:Name="PairStatus" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
                 <TextBlock Text="The command contains sensitive Google cookies. It goes only to the local pairing process and the box is cleared after you submit it."
                            FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
+                </StackPanel>
             </StackPanel>
         </ScrollViewer>
 
         <!-- ===== Inbox ===== -->
-        <Grid x:Name="InboxPanel" Grid.Row="1" Visibility="Collapsed">
+        <Grid x:Name="InboxPanel" Grid.Row="2" Visibility="Collapsed">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition x:Name="ListColumn" Width="380" />
                 <ColumnDefinition x:Name="ThreadColumn" Width="*" />
@@ -422,33 +465,14 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <Grid Margin="24,4,20,0">
-                    <TextBlock Text="messages" Style="{StaticResource MetroHeaderText}" VerticalAlignment="Center" />
-                    <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Right" VerticalAlignment="Center">
-                        <Button Style="{StaticResource CircleButtonStyle}" Content="&#xE710;" Click="NewChat_Click"
-                                ToolTipService.ToolTip="New conversation (Ctrl+N)" AutomationProperties.Name="New conversation" />
-                        <Button Style="{StaticResource CircleButtonStyle}" Content="&#xE712;"
-                                ToolTipService.ToolTip="More" AutomationProperties.Name="More options">
-                            <Button.Flyout>
-                                <MenuFlyout Placement="BottomEdgeAlignedRight">
-                                    <MenuFlyoutItem Text="Mark all as read" Click="MarkAllRead_Click">
-                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8C3;" /></MenuFlyoutItem.Icon>
-                                    </MenuFlyoutItem>
-                                    <MenuFlyoutItem Text="Refresh" Click="Refresh_Click">
-                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE72C;" /></MenuFlyoutItem.Icon>
-                                    </MenuFlyoutItem>
-                                    <ToggleMenuFlyoutItem x:Name="NotificationsToggle" Text="Notifications" IsChecked="True" Click="NotificationsToggle_Click" />
-                                    <MenuFlyoutSeparator />
-                                    <MenuFlyoutItem Text="Pair again" Click="PairAgain_Click">
-                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8EA;" /></MenuFlyoutItem.Icon>
-                                    </MenuFlyoutItem>
-                                </MenuFlyout>
-                            </Button.Flyout>
-                        </Button>
-                    </StackPanel>
-                </Grid>
-                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="24,12,0,12">
+                <StackPanel x:Name="MessagesHeader" Orientation="Horizontal" Margin="24,2,20,0" Background="Transparent">
+                    <Button Content="messages" Style="{StaticResource SectionHeaderButtonStyle}" AutomationProperties.Name="Messages" />
+                    <Button Content="calls" Style="{StaticResource SectionHeaderButtonStyle}" Opacity="0.4" Click="CallsSection_Click"
+                            AutomationProperties.Name="Calls" ToolTipService.ToolTip="Calls (Ctrl+D)" />
+                </StackPanel>
+                <StackPanel x:Name="MessagesFilters" Grid.Row="1" Orientation="Horizontal" Margin="24,4,0,12" Background="Transparent">
                     <Button x:Name="FilterAll" Content="all" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="all" />
                     <Button x:Name="FilterUnread" Content="unread" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="unread" />
                     <Button x:Name="FilterArchived" Content="archived" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="archived" />
@@ -464,8 +488,8 @@
                         <Button x:Name="AuthBannerAction" Grid.Row="1" Content="pair again" Style="{StaticResource FlatTextButtonStyle}" Foreground="White"
                                 FontWeight="SemiBold" Padding="0,2" Click="AuthBannerAction_Click" />
                     </Grid>
-                    <TextBox x:Name="SearchBox" Margin="24,0,20,10" PlaceholderText="search people and messages"
-                             TextChanged="SearchBox_TextChanged" KeyDown="SearchBox_KeyDown" AutomationProperties.Name="Search" />
+                    <TextBox x:Name="SearchBox" Margin="24,0,20,10" PlaceholderText="search people and messages" Visibility="Collapsed"
+                             TextChanged="SearchBox_TextChanged" KeyDown="SearchBox_KeyDown" LostFocus="SearchBox_LostFocus" AutomationProperties.Name="Search" />
                 </StackPanel>
                 <ListView x:Name="ConversationList" Grid.Row="3" SelectionMode="Single" Padding="0,0,0,12"
                           ItemContainerStyle="{StaticResource MetroListItemStyle}"
@@ -483,6 +507,32 @@
                     <TextBlock x:Name="ListEmptyTitle" FontFamily="{StaticResource MetroDisplayFont}" FontSize="24" FontWeight="Light" />
                     <TextBlock x:Name="ListEmptyText" Opacity="0.6" TextWrapping="Wrap" />
                 </StackPanel>
+                <!-- Metro app bar: the list's commands, out of the header. -->
+                <Border Grid.Row="4" Style="{StaticResource MetroAppBarStyle}">
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="4">
+                        <Button Style="{StaticResource MetroAppBarButtonStyle}" Click="NewChat_Click" Tag="&#xE710;" Content="new"
+                                ToolTipService.ToolTip="New conversation (Ctrl+N)" AutomationProperties.Name="New conversation" />
+                        <Button Style="{StaticResource MetroAppBarButtonStyle}" Click="SearchToggle_Click" Tag="&#xE721;" Content="search"
+                                ToolTipService.ToolTip="Search (Ctrl+F)" AutomationProperties.Name="Search" />
+                        <Button Style="{StaticResource MetroAppBarButtonStyle}" Tag="&#xE712;" Content="more" AutomationProperties.Name="More options">
+                            <Button.Flyout>
+                                <MenuFlyout Placement="TopEdgeAlignedRight">
+                                    <MenuFlyoutItem Text="Mark all as read" Click="MarkAllRead_Click">
+                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8C3;" /></MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Refresh" Click="Refresh_Click">
+                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE72C;" /></MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <ToggleMenuFlyoutItem x:Name="NotificationsToggle" Text="Notifications" IsChecked="True" Click="NotificationsToggle_Click" />
+                                    <MenuFlyoutSeparator />
+                                    <MenuFlyoutItem Text="Pair again" Click="PairAgain_Click">
+                                        <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8EA;" /></MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                </MenuFlyout>
+                            </Button.Flyout>
+                        </Button>
+                    </StackPanel>
+                </Border>
             </Grid>
 
             <Grid x:Name="ThreadPane" Grid.Column="1" AllowDrop="True" DragOver="Thread_DragOver" Drop="Thread_Drop">
@@ -604,8 +654,28 @@
             </Grid>
         </Grid>
 
+        <!-- ===== Calls ===== -->
+        <views:CallsView x:Name="CallsPanel" Grid.Row="2" Visibility="Collapsed" />
+
+        <!-- ===== Call in progress, shown while another section is open ===== -->
+        <Button x:Name="CallBar" Grid.Row="1" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Padding="0"
+                Visibility="Collapsed" Click="CallBar_Click" BorderThickness="0" CornerRadius="0" Background="{StaticResource CallAnswerBrush}"
+                AutomationProperties.Name="Return to call">
+            <Grid Padding="24,6,12,6" ColumnSpacing="14" RequestedTheme="Dark">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <FontIcon Glyph="&#xE717;" FontSize="14" Foreground="White" />
+                <TextBlock x:Name="CallBarText" Grid.Column="1" Foreground="White" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                <Button Grid.Column="2" Style="{StaticResource FlatTextButtonStyle}" Foreground="White" Content="end" Padding="10,2"
+                        FontWeight="SemiBold" Click="CallBarEnd_Click" AutomationProperties.Name="End call" />
+            </Grid>
+        </Button>
+
         <!-- ===== Status banner ===== -->
-        <Border x:Name="StatusBanner" Grid.Row="1" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,96"
+        <Border x:Name="StatusBanner" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,96"
                 Background="#F0202020" Padding="18,10" Visibility="Collapsed" MaxWidth="560" RequestedTheme="Dark">
             <StackPanel Orientation="Horizontal" Spacing="18">
                 <TextBlock x:Name="StatusText" Foreground="White" TextWrapping="Wrap" VerticalAlignment="Center" MaxWidth="440" />
@@ -615,7 +685,7 @@
         </Border>
 
         <!-- ===== Full-window media viewer ===== -->
-        <Grid x:Name="ViewerOverlay" Grid.RowSpan="2" Visibility="Collapsed" Background="#F2000000" RequestedTheme="Dark"
+        <Grid x:Name="ViewerOverlay" Grid.RowSpan="3" Visibility="Collapsed" Background="#F2000000" RequestedTheme="Dark"
               Tapped="ViewerBackground_Tapped">
             <Image x:Name="ViewerImage" Stretch="Uniform" Margin="40,80,40,40" />
             <MediaPlayerElement x:Name="ViewerPlayer" Margin="40,80,40,40" AreTransportControlsEnabled="True" Visibility="Collapsed" />

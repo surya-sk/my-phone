@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <RootNamespace>Messages</RootNamespace>
     <AssemblyTitle>My Phone</AssemblyTitle>
     <Product>My Phone</Product>
@@ -29,5 +29,6 @@
     <!-- Explorer reads the identity's resource index from the exe folder; without it the taskbar icon is blank.
          WinUI's own index is Messages.pri, so this name is free. Regenerate with makepri after changing logos. -->
     <Content Include="Identity\resources.pri" Link="resources.pri" CopyToOutputDirectory="PreserveNewest" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
   </ItemGroup>
 </Project>

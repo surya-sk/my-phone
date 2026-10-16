@@ -92,6 +92,7 @@ public sealed partial class MainWindow : Window
     private string? _pendingSelectId;
     private string? _pendingJumpMessageId;
     private CancellationTokenSource? _eventsCts;
+    private CancellationTokenSource? _qrCts;
     private DateTimeOffset _typingExpires;
     private ScrollViewer? _messageScroller;
     private MediaPlayer? _audioPlayer;
@@ -128,7 +129,24 @@ public sealed partial class MainWindow : Window
                 .FirstOrDefault(item => item.Tag is string browser && BrowserAuth.IsInstalled(browser));
         UpdateFilterHeaders();
         AddAccelerator(VirtualKey.N, (_, _) => NewChat_Click(this, new RoutedEventArgs()));
-        AddAccelerator(VirtualKey.F, (_, _) => { if (InboxPanel.Visibility == Visibility.Visible) SearchBox.Focus(FocusState.Keyboard); });
+        AddAccelerator(VirtualKey.F, (_, _) =>
+        {
+            if (InboxPanel.Visibility == Visibility.Visible) ShowSearch();
+            else if (CallsPanel.Visibility == Visibility.Visible) CallsPanel.ShowSearch();
+        });
+        foreach (var header in new UIElement[] { MessagesHeader, MessagesFilters, ListEmpty })
+            Controls.SwipeGesture.Attach(header, MessagesSwipe, touchpad: false);
+        Controls.SwipeGesture.Attach(ListPane, MessagesSwipe, touch: false);
+        // In the one-column layout, swiping a conversation to the right goes back to the list.
+        Controls.SwipeGesture.Attach(ThreadPane, direction => { if (direction > 0 && _narrow && _selected is not null) CloseThread(); });
+        AddAccelerator(VirtualKey.D, (_, _) => { if (_inboxReady) ShowSection(calls: CallsPanel.Visibility != Visibility.Visible); });
+        CallsPanel.MessagesRequested += () => ShowSection(calls: false);
+        CallsPanel.TextRequested += async (number, name) =>
+        {
+            ShowSection(calls: false);
+            await OpenConversationWithAsync(number, name);
+        };
+        CallsPanel.CallsChanged += UpdateCallBar;
 
         Activated += OnActivated;
         Closed += OnClosed;
@@ -159,9 +177,12 @@ public sealed partial class MainWindow : Window
 
     private async Task InitializeAsync()
     {
+        // Calls run over Bluetooth and don't depend on the Google Messages session.
+        _ = CallsPanel.InitializeAsync();
         if (!_backend.HasSession)
         {
             SetConnection(null, "not paired");
+            StartQrPairing();
             return;
         }
         PairStatus.Text = "Starting your paired phone connection…";
@@ -197,7 +218,13 @@ public sealed partial class MainWindow : Window
 
     private void BuildPairingSteps()
     {
-        var steps = new[]
+        AddSteps(QrSteps, new[]
+        {
+            "On your phone, open Google Messages.",
+            "Tap your profile picture, then Device pairing → QR code scanner.",
+            "Point your phone at this code. My Phone opens your messages once it's scanned."
+        });
+        AddSteps(PairingSteps, new[]
         {
             "Choose your browser, then select open Google sign-in. Sign in with the account chosen in Google Messages on your phone. Keep this dedicated browser profile signed in so My Phone can renew its session.",
             "When the browser reaches messages.google.com/web/config, press F12 and open the Network tab.",
@@ -205,7 +232,11 @@ public sealed partial class MainWindow : Window
             "Right-click that request. Edge: Copy → Copy as cURL (bash). Firefox: Copy → Copy as cURL.",
             "Paste it below with Ctrl+V. It starts with curl and contains a Cookie header. Select pair phone.",
             "On your phone open Google Messages → account menu → Device pairing, and tap the emoji shown here."
-        };
+        });
+    }
+
+    private static void AddSteps(ItemsControl target, string[] steps)
+    {
         for (var i = 0; i < steps.Length; i++)
         {
             var row = new Grid { ColumnSpacing = 18 };
@@ -224,8 +255,67 @@ public sealed partial class MainWindow : Window
             var text = new TextBlock { Text = steps[i], TextWrapping = TextWrapping.Wrap, FontSize = 15, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(text, 1);
             row.Children.Add(text);
-            PairingSteps.Items.Add(row);
+            target.Items.Add(row);
         }
+    }
+
+    /// <summary>Runs QR pairing until the phone scans a code, the codes run out, or the user leaves the QR view.</summary>
+    private async void StartQrPairing()
+    {
+        _qrCts?.Cancel();
+        var cts = _qrCts = new CancellationTokenSource(TimeSpan.FromMinutes(9));
+        QrImage.Source = null;
+        QrRetry.Visibility = Visibility.Collapsed;
+        QrProgress.IsActive = true;
+        QrStatus.Text = "Getting a pairing code…";
+        try
+        {
+            await _backend.PairWithQrAsync(url => DispatcherQueue.TryEnqueue(() =>
+            {
+                if (cts.IsCancellationRequested) return;
+                QrImage.Source = QrBitmap(url);
+                QrProgress.IsActive = false;
+                QrStatus.Text = "Waiting for your phone to scan the code…";
+            }), cts.Token);
+            QrStatus.Text = "Paired. Opening your messages…";
+            await ShowInboxAsync();
+        }
+        catch (Exception ex)
+        {
+            if (_qrCts != cts) return;  // Replaced by a newer attempt or by the account flow.
+            QrStatus.Text = ex is OperationCanceledException ? "The code expired." : ex.Message;
+            QrImage.Source = null;
+            QrRetry.Visibility = Visibility.Visible;
+        }
+        finally { if (_qrCts == cts) QrProgress.IsActive = false; }
+    }
+
+    private static Microsoft.UI.Xaml.Media.Imaging.BitmapImage QrBitmap(string text)
+    {
+        using var generator = new QRCoder.QRCodeGenerator();
+        using var data = generator.CreateQrCode(text, QRCoder.QRCodeGenerator.ECCLevel.L);
+        var png = new QRCoder.PngByteQRCode(data).GetGraphic(8, drawQuietZones: false);
+        var bitmap = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage();
+        bitmap.SetSource(new MemoryStream(png).AsRandomAccessStream());
+        return bitmap;
+    }
+
+    private void QrRetry_Click(object sender, RoutedEventArgs e) => StartQrPairing();
+
+    private void ShowAccountPairing_Click(object sender, RoutedEventArgs e)
+    {
+        var cts = _qrCts;
+        _qrCts = null;
+        cts?.Cancel();
+        QrPairingPanel.Visibility = Visibility.Collapsed;
+        AccountPairingPanel.Visibility = Visibility.Visible;
+    }
+
+    private void ShowQrPairing_Click(object sender, RoutedEventArgs e)
+    {
+        AccountPairingPanel.Visibility = Visibility.Collapsed;
+        QrPairingPanel.Visibility = Visibility.Visible;
+        StartQrPairing();
     }
 
     private void OpenSignIn_Click(object sender, RoutedEventArgs e)
@@ -303,6 +393,9 @@ public sealed partial class MainWindow : Window
         PairingPanel.Visibility = Visibility.Visible;
         SetConnection(null, "not paired");
         UpdateBadge();
+        AccountPairingPanel.Visibility = Visibility.Collapsed;
+        QrPairingPanel.Visibility = Visibility.Visible;
+        StartQrPairing();
     }
 
     private void OnActivated(object sender, WindowActivatedEventArgs args)
@@ -665,17 +758,58 @@ public sealed partial class MainWindow : Window
     // Inbox
     // =====================================================================
 
-    private void Filter_Click(object sender, RoutedEventArgs e)
-    {
-        _filter = (sender as FrameworkElement)?.Tag switch
+    private void Filter_Click(object sender, RoutedEventArgs e) =>
+        SetFilter((sender as FrameworkElement)?.Tag switch
         {
             "unread" => InboxFilter.Unread,
             "archived" => InboxFilter.Archived,
             _ => InboxFilter.All
-        };
+        });
+
+    private void SetFilter(InboxFilter filter)
+    {
+        _filter = filter;
         UpdateFilterHeaders();
         if (SearchBox.Text.Length > 0) SearchBox.Text = ""; // rebuilds through TextChanged
         else RebuildInbox();
+    }
+
+    /// <summary>Swiping the list moves through all → unread → archived, then on to calls.</summary>
+    private void MessagesSwipe(int direction)
+    {
+        var next = (int)_filter - direction;
+        if (next > (int)InboxFilter.Archived) ShowSection(calls: true);
+        else if (next >= 0) SetFilter((InboxFilter)next);
+    }
+
+    private void SwipeRead_Invoked(SwipeItem sender, SwipeItemInvokedEventArgs args)
+    {
+        if (args.SwipeControl.DataContext is ConversationItem item) _ = MarkReadAsync(item.Model);
+    }
+
+    private async void SwipeArchive_Invoked(SwipeItem sender, SwipeItemInvokedEventArgs args)
+    {
+        if (args.SwipeControl.DataContext is not ConversationItem item) return;
+        try { await SetArchivedAsync(item.Model, !item.Model.IsArchived); }
+        catch (Exception ex) { ShowStatus(ex.Message); }
+        await RefreshAsync(includeThread: false);
+    }
+
+    private void SearchToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (SearchBox.Visibility == Visibility.Visible && SearchBox.Text.Length == 0) SearchBox.Visibility = Visibility.Collapsed;
+        else ShowSearch();
+    }
+
+    private void ShowSearch()
+    {
+        SearchBox.Visibility = Visibility.Visible;
+        SearchBox.Focus(FocusState.Keyboard);
+    }
+
+    private void SearchBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (SearchBox.Text.Length == 0) SearchBox.Visibility = Visibility.Collapsed;
     }
 
     private void UpdateFilterHeaders()
@@ -797,7 +931,13 @@ public sealed partial class MainWindow : Window
 
     private void SearchBox_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key == VirtualKey.Escape) { SearchBox.Text = ""; e.Handled = true; }
+        if (e.Key == VirtualKey.Escape)
+        {
+            SearchBox.Text = "";
+            SearchBox.Visibility = Visibility.Collapsed;
+            ConversationList.Focus(FocusState.Keyboard);
+            e.Handled = true;
+        }
         else if (e.Key == VirtualKey.Down && _inboxItems.Count > 0) { ConversationList.Focus(FocusState.Keyboard); e.Handled = true; }
     }
 
@@ -947,6 +1087,12 @@ public sealed partial class MainWindow : Window
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
         var number = chosen?.Number ?? box.Text.Split('·').Last().Trim();
         if (string.IsNullOrWhiteSpace(number)) return;
+        await OpenConversationWithAsync(number, chosen?.Name ?? "");
+    }
+
+    /// <summary>Opens (or starts) the one-to-one conversation with a number.</summary>
+    private async Task OpenConversationWithAsync(string number, string name)
+    {
         try
         {
             var id = await _client.NewConversationAsync(number);
@@ -954,8 +1100,8 @@ public sealed partial class MainWindow : Window
             SearchBox.Text = "";
             await RefreshAsync(includeThread: false);
             var conversation = _allConversations.FirstOrDefault(c => c.Id == id)
-                ?? new Conversation(id, chosen?.DisplayName ?? number, "", 0, "", 0, false,
-                    new[] { new Participant("", chosen?.Name ?? "", number, false, "") }, false, "", "");
+                ?? new Conversation(id, string.IsNullOrWhiteSpace(name) ? number : name, "", 0, "", 0, false,
+                    new[] { new Participant("", name, number, false, "") }, false, "", "");
             SelectInList(conversation);
             if (!_allConversations.Any(c => c.Id == id)) _pendingSelectId = id;
         }
@@ -1949,9 +2095,109 @@ public sealed partial class MainWindow : Window
     // Layout, keyboard, status
     // =====================================================================
 
+    // =====================================================================
+    // Sections and calls
+    // =====================================================================
+
+    private void ShowSection(bool calls)
+    {
+        if (!_inboxReady && calls) return;
+        CallsPanel.Visibility = Ui.Show(calls);
+        InboxPanel.Visibility = Ui.Show(!calls);
+        CallsPanel.ApplyLayout(Root.ActualWidth);
+        UpdateCallBar();
+    }
+
+    private void CallsSection_Click(object sender, RoutedEventArgs e) => ShowSection(calls: true);
+
+    private readonly DispatcherTimer _callBarTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+
+    private void UpdateCallBar()
+    {
+        var calls = CallsPanel.Calls.Calls;
+        var show = calls.Count > 0 && CallsPanel.Visibility != Visibility.Visible;
+        CallBar.Visibility = Ui.Show(show);
+        // A ringing call brings the calls section forward, the way a phone would.
+        if (calls.Any(c => c.Status == Windows.ApplicationModel.Calls.PhoneCallStatus.Incoming) && _inboxReady
+            && CallsPanel.Visibility != Visibility.Visible)
+        {
+            ShowSection(calls: true);
+            return;
+        }
+        if (!show) { _callBarTimer.Stop(); return; }
+        var call = calls.FirstOrDefault(c => c.Status == Windows.ApplicationModel.Calls.PhoneCallStatus.Talking) ?? calls[0];
+        var name = CallsPanel.DisplayName(call.Number, call.Name);
+        var state = call.Status switch
+        {
+            Windows.ApplicationModel.Calls.PhoneCallStatus.Talking when call.TalkingSince is { } since => Views.CallsView.Duration(DateTimeOffset.Now - since),
+            Windows.ApplicationModel.Calls.PhoneCallStatus.Held => "on hold",
+            Windows.ApplicationModel.Calls.PhoneCallStatus.Dialing => "calling…",
+            _ => "on a call"
+        };
+        CallBarText.Text = $"{name}  ·  {state}";
+        if (!_callBarTimer.IsEnabled)
+        {
+            _callBarTimer.Tick -= CallBarTick;
+            _callBarTimer.Tick += CallBarTick;
+            _callBarTimer.Start();
+        }
+    }
+
+    private void CallBarTick(object? sender, object e) => UpdateCallBar();
+
+    private void CallBar_Click(object sender, RoutedEventArgs e) => ShowSection(calls: true);
+
+    private async void CallBarEnd_Click(object sender, RoutedEventArgs e)
+    {
+        if (CallsPanel.Calls.Calls.FirstOrDefault() is not { } call) return;
+        try { await Services.PhoneCalls.RunAsync(() => call.Call.EndAsync(), "end the call"); }
+        catch (Exception ex) { ShowStatus(ex.Message); }
+    }
+
+    /// <summary>Missed-call notification buttons: call back, message, or just open the calls section.</summary>
+    public void HandleCallNotification(string action, string number, string callId = "")
+    {
+        // Declining from the notification shouldn't pull the window up.
+        if (action == "decline")
+        {
+            _ = CallsPanel.DeclineAsync(callId);
+            return;
+        }
+        BringToFront();
+        if (!_inboxReady)
+        {
+            _readyActions.Add(() => { HandleCallNotification(action, number, callId); return Task.CompletedTask; });
+            return;
+        }
+        switch (action)
+        {
+            case "answer":
+                ShowSection(calls: true);
+                _ = CallsPanel.AnswerAsync(callId);
+                break;
+            case "decline-text":
+                _ = CallsPanel.DeclineAsync(callId);
+                ShowSection(calls: false);
+                _ = OpenConversationWithAsync(number, "");
+                break;
+            case "call":
+                ShowSection(calls: true);
+                _ = CallsPanel.DialAsync(number);
+                break;
+            case "text":
+                ShowSection(calls: false);
+                _ = OpenConversationWithAsync(number, "");
+                break;
+            default:
+                ShowSection(calls: true);
+                break;
+        }
+    }
+
     private void ApplyLayout(double width)
     {
         if (width <= 0) return;
+        CallsPanel.ApplyLayout(width);
         _narrow = width < 760;
         if (!_narrow)
         {

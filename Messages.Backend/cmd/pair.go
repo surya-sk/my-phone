@@ -25,7 +25,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/client"
 )
 
-const maxQRRefreshes = 5
+// About ten minutes of fresh codes; the Windows app restarts pairing after that.
+const maxQRRefreshes = 20
 
 type pairMode string
 

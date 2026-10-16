@@ -1,0 +1,279 @@
+<UserControl
+    x:Class="Messages.Views.CallsView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Messages.Views">
+
+    <UserControl.Resources>
+        <DataTemplate x:Key="CallRowTemplate" x:DataType="local:CallRow">
+            <SwipeControl>
+            <SwipeControl.LeftItems>
+                <SwipeItems Mode="Execute">
+                    <SwipeItem Text="call" Background="{StaticResource CallAnswerBrush}" Foreground="White" Invoked="SwipeCall_Invoked">
+                        <SwipeItem.IconSource><FontIconSource Glyph="&#xE717;" /></SwipeItem.IconSource>
+                    </SwipeItem>
+                </SwipeItems>
+            </SwipeControl.LeftItems>
+            <SwipeControl.RightItems>
+                <SwipeItems Mode="Execute">
+                    <SwipeItem Text="text" Background="{ThemeResource MetroAccentBrush}" Foreground="White" Invoked="SwipeText_Invoked">
+                        <SwipeItem.IconSource><FontIconSource Glyph="&#xE8BD;" /></SwipeItem.IconSource>
+                    </SwipeItem>
+                </SwipeItems>
+            </SwipeControl.RightItems>
+            <Grid Padding="24,8,20,8" ColumnSpacing="14" Background="Transparent">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Grid Width="44" Height="44" Background="{x:Bind Tile}">
+                    <TextBlock Text="{x:Bind Initials}" Foreground="White" FontFamily="{StaticResource MetroDisplayFont}" FontSize="18"
+                               FontWeight="Light" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    <FontIcon Glyph="&#xE77B;" Foreground="White" FontSize="18" Visibility="{x:Bind PersonIcon}" />
+                    <Image Source="{x:Bind Photo}" Stretch="UniformToFill" />
+                </Grid>
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <TextBlock Text="{x:Bind Title}" FontSize="16" TextTrimming="CharacterEllipsis" Foreground="{x:Bind TitleBrush}" />
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock Text="{x:Bind KindGlyph}" FontSize="12" Opacity="0.65" Visibility="{x:Bind KindVisible}" />
+                        <TextBlock Text="{x:Bind Detail}" FontSize="12" Opacity="0.65" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </StackPanel>
+                <TextBlock Grid.Column="2" Text="{x:Bind Time}" FontSize="12" Opacity="0.6" VerticalAlignment="Top" Margin="0,4,0,0" />
+            </Grid>
+            </SwipeControl>
+        </DataTemplate>
+    </UserControl.Resources>
+
+    <Grid x:Name="Root">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition x:Name="ListColumn" Width="380" />
+            <ColumnDefinition x:Name="DetailColumn" Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- ===== List pane ===== -->
+        <Grid x:Name="ListPane" Background="{ThemeResource PaneBrush}">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <StackPanel x:Name="CallsHeader" Orientation="Horizontal" Margin="24,2,20,0" Background="Transparent">
+                <Button Content="messages" Style="{StaticResource SectionHeaderButtonStyle}" Opacity="0.4" Click="MessagesSection_Click"
+                        AutomationProperties.Name="Messages" ToolTipService.ToolTip="Messages (Ctrl+D)" />
+                <Button Content="calls" Style="{StaticResource SectionHeaderButtonStyle}" AutomationProperties.Name="Calls" />
+            </StackPanel>
+            <StackPanel x:Name="CallsFilters" Grid.Row="1" Orientation="Horizontal" Margin="24,4,0,12" Background="Transparent">
+                <Button x:Name="FilterRecent" Content="recent" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="recent" />
+                <Button x:Name="FilterMissed" Content="missed" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="missed" />
+                <Button x:Name="FilterContacts" Content="contacts" Style="{StaticResource PivotHeaderButtonStyle}" Click="Filter_Click" Tag="contacts" />
+            </StackPanel>
+            <StackPanel Grid.Row="2">
+                <TextBlock x:Name="LineStatus" Margin="24,0,20,10" Style="{StaticResource MetroCaptionText}" TextWrapping="Wrap" Visibility="Collapsed" />
+                <TextBox x:Name="SearchBox" Margin="24,0,20,10" PlaceholderText="search contacts or type a number" Visibility="Collapsed"
+                         TextChanged="SearchBox_TextChanged" KeyDown="SearchBox_KeyDown" LostFocus="SearchBox_LostFocus" AutomationProperties.Name="Search contacts" />
+            </StackPanel>
+            <ListView x:Name="CallList" Grid.Row="3" SelectionMode="None" IsItemClickEnabled="True" ItemClick="CallList_ItemClick"
+                      Padding="0,0,0,12" ItemContainerStyle="{StaticResource MetroListItemStyle}" ItemTemplate="{StaticResource CallRowTemplate}">
+                <ListView.ItemContainerTransitions>
+                    <TransitionCollection>
+                        <EntranceThemeTransition IsStaggeringEnabled="True" FromVerticalOffset="0" FromHorizontalOffset="40" />
+                    </TransitionCollection>
+                </ListView.ItemContainerTransitions>
+            </ListView>
+            <StackPanel x:Name="ListEmpty" Grid.Row="3" Margin="24,20,24,0" Spacing="6" Visibility="Collapsed">
+                <TextBlock x:Name="ListEmptyTitle" FontFamily="{StaticResource MetroDisplayFont}" FontSize="24" FontWeight="Light" TextWrapping="Wrap" />
+                <TextBlock x:Name="ListEmptyText" Opacity="0.6" TextWrapping="Wrap" />
+            </StackPanel>
+            <ProgressBar x:Name="SyncProgress" Grid.Row="3" VerticalAlignment="Top" IsIndeterminate="True" Visibility="Collapsed" />
+            <Border Grid.Row="4" Style="{StaticResource MetroAppBarStyle}">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="4">
+                    <Button x:Name="DialPadButton" Style="{StaticResource MetroAppBarButtonStyle}" Click="ShowDialPad_Click" Tag="&#xE75F;" Content="keypad"
+                            ToolTipService.ToolTip="Dial pad" AutomationProperties.Name="Dial pad" />
+                    <Button Style="{StaticResource MetroAppBarButtonStyle}" Click="SearchToggle_Click" Tag="&#xE721;" Content="search"
+                            ToolTipService.ToolTip="Search (Ctrl+F)" AutomationProperties.Name="Search" />
+                    <Button Style="{StaticResource MetroAppBarButtonStyle}" Tag="&#xE712;" Content="more" AutomationProperties.Name="More options">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="TopEdgeAlignedRight">
+                                <MenuFlyoutItem Text="Refresh calls and contacts" Click="Sync_Click">
+                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE72C;" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutItem Text="Bluetooth settings" Click="BluetoothSettings_Click">
+                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE702;" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem x:Name="DisconnectItem" Text="Stop using this phone for calls" Click="Disconnect_Click">
+                                    <MenuFlyoutItem.Icon><FontIcon Glyph="&#xE8CD;" /></MenuFlyoutItem.Icon>
+                                </MenuFlyoutItem>
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- ===== Detail pane ===== -->
+        <Grid x:Name="DetailPane" Grid.Column="1">
+            <Button x:Name="BackButton" Style="{StaticResource CircleButtonStyle}" Content="&#xE72B;" Visibility="Collapsed"
+                    Click="Back_Click" AutomationProperties.Name="Back" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="20,4,0,0"
+                    Canvas.ZIndex="1" />
+
+            <!-- Setup: choose the phone to take calls from. -->
+            <ScrollViewer x:Name="SetupPanel" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="64,48,40,40" Spacing="18" MaxWidth="560" HorizontalAlignment="Left">
+                    <FontIcon Glyph="&#xE717;" FontSize="56" HorizontalAlignment="Left" Opacity="0.25" />
+                    <TextBlock Text="calls on this PC" Style="{StaticResource MetroHeaderText}" FontSize="40" />
+                    <TextBlock TextWrapping="Wrap" FontSize="15" Opacity="0.72"
+                               Text="Your phone connects over Bluetooth like a car does. Calls ring here, you talk through this PC's speakers and microphone, and you can dial from your keyboard. Nothing to install on the phone." />
+                    <TextBlock Text="choose your phone" Style="{StaticResource MetroSubheaderText}" FontSize="22" Margin="0,8,0,0" />
+                    <ItemsControl x:Name="PhoneChoices" IsTabStop="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><StackPanel Spacing="8" /></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                    </ItemsControl>
+                    <TextBlock x:Name="NoPhonesText" TextWrapping="Wrap" Opacity="0.72" Visibility="Collapsed"
+                               Text="No phone is paired with this PC yet. Open Bluetooth settings, select Add device → Bluetooth, and pick your phone. Accept the pairing code on both screens, then come back here." />
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <Button Content="open Bluetooth settings" Click="BluetoothSettings_Click" Padding="18,8" />
+                        <Button Content="look again" Click="LookAgain_Click" Padding="18,8" />
+                        <ProgressRing x:Name="SetupProgress" IsActive="False" Width="24" Height="24" />
+                    </StackPanel>
+                    <TextBlock x:Name="SetupStatus" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- Dial pad -->
+            <Grid x:Name="DialPanel" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center" Width="300" RowSpacing="18">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="NumberBox" FontFamily="{StaticResource MetroDisplayFont}" FontSize="30" FontWeight="Light"
+                             BorderThickness="0" Background="Transparent" TextAlignment="Center" PlaceholderText="enter a number"
+                             TextChanged="NumberBox_TextChanged" KeyDown="NumberBox_KeyDown" AutomationProperties.Name="Phone number" />
+                    <Button Grid.Column="1" Style="{StaticResource FlatTextButtonStyle}" Width="44" Height="44" Click="Backspace_Click"
+                            AutomationProperties.Name="Delete digit" ToolTipService.ToolTip="Delete">
+                        <FontIcon Glyph="&#xE750;" FontSize="18" />
+                    </Button>
+                </Grid>
+                <TextBlock x:Name="NumberMatch" Grid.Row="1" HorizontalAlignment="Center" Opacity="0.65" TextTrimming="CharacterEllipsis" />
+                <Grid x:Name="DialKeys" Grid.Row="2" Height="296" RowSpacing="4" ColumnSpacing="4" />
+                <Button x:Name="CallButton" Grid.Row="3" HorizontalAlignment="Center" Width="64" Height="64" Click="Call_Click"
+                        Style="{StaticResource AccentCircleButtonStyle}" Background="{StaticResource CallAnswerBrush}" BorderBrush="{StaticResource CallAnswerBrush}"
+                        FontSize="22" Content="&#xE717;" AutomationProperties.Name="Call" ToolTipService.ToolTip="Call (Enter)" />
+            </Grid>
+
+            <!-- Call in progress -->
+            <Grid x:Name="CallPanel" Visibility="Collapsed">
+                <Grid.Background>
+                    <SolidColorBrush Color="{ThemeResource SystemAccentColorDark2}" />
+                </Grid.Background>
+                <Grid RequestedTheme="Dark" Margin="64,48,48,48" RowSpacing="18">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Spacing="6">
+                        <TextBlock x:Name="CallState" FontSize="15" Foreground="White" Opacity="0.8" />
+                        <TextBlock x:Name="CallName" Style="{StaticResource MetroHeaderText}" FontSize="52" LineHeight="58" Foreground="White" TextWrapping="Wrap" />
+                        <TextBlock x:Name="CallNumber" FontSize="17" Foreground="White" Opacity="0.75" />
+                        <TextBlock x:Name="CallOthers" FontSize="13" Foreground="White" Opacity="0.65" Visibility="Collapsed" />
+                    </StackPanel>
+                    <Grid Grid.Row="1" Width="168" Height="168" HorizontalAlignment="Left" VerticalAlignment="Center" x:Name="CallTile">
+                        <TextBlock x:Name="CallInitials" Foreground="White" FontFamily="{StaticResource MetroDisplayFont}" FontSize="64" FontWeight="Light"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <FontIcon x:Name="CallPersonIcon" Glyph="&#xE77B;" Foreground="White" FontSize="64" Visibility="Collapsed" />
+                        <Image x:Name="CallPhoto" Stretch="UniformToFill" />
+                    </Grid>
+                    <Grid x:Name="InCallKeys" Grid.Row="1" Width="260" Height="250" RowSpacing="4" ColumnSpacing="4" HorizontalAlignment="Right"
+                          VerticalAlignment="Center" Visibility="Collapsed" />
+                    <StackPanel Grid.Row="2" Spacing="16">
+                        <StackPanel x:Name="IncomingButtons" Orientation="Horizontal" Spacing="28" Visibility="Collapsed">
+                            <StackPanel Spacing="6">
+                                <Button Width="64" Height="64" Style="{StaticResource AccentCircleButtonStyle}" Background="{StaticResource CallAnswerBrush}"
+                                        BorderBrush="{StaticResource CallAnswerBrush}" FontSize="22" Content="&#xE717;" Click="Answer_Click" AutomationProperties.Name="Answer" />
+                                <TextBlock Text="answer" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                            <StackPanel Spacing="6">
+                                <Button Width="64" Height="64" Style="{StaticResource AccentCircleButtonStyle}" Background="{StaticResource CallEndBrush}"
+                                        BorderBrush="{StaticResource CallEndBrush}" FontSize="22" Content="&#xE778;" Click="Decline_Click" AutomationProperties.Name="Decline" />
+                                <TextBlock Text="decline" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                            <StackPanel Spacing="6" x:Name="DeclineTextPanel">
+                                <Button Width="64" Height="64" Style="{StaticResource LightCircleButtonStyle}" FontSize="20" Content="&#xE8BD;" Click="DeclineWithText_Click"
+                                        AutomationProperties.Name="Decline and send a message" />
+                                <TextBlock Text="text" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                        </StackPanel>
+                        <StackPanel x:Name="ActiveButtons" Orientation="Horizontal" Spacing="22" Visibility="Collapsed">
+                            <StackPanel Spacing="6">
+                                <ToggleButton x:Name="MuteButton" Width="56" Height="56" CornerRadius="28" Click="Mute_Click" AutomationProperties.Name="Mute">
+                                    <FontIcon Glyph="&#xE720;" FontSize="18" />
+                                </ToggleButton>
+                                <TextBlock Text="mute" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                            <StackPanel Spacing="6">
+                                <ToggleButton x:Name="KeypadButton" Width="56" Height="56" CornerRadius="28" Click="Keypad_Click" AutomationProperties.Name="Keypad">
+                                    <FontIcon Glyph="&#xE75F;" FontSize="18" />
+                                </ToggleButton>
+                                <TextBlock Text="keypad" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                            <StackPanel Spacing="6" x:Name="HoldPanel">
+                                <ToggleButton x:Name="HoldButton" Width="56" Height="56" CornerRadius="28" Click="Hold_Click" AutomationProperties.Name="Hold">
+                                    <FontIcon Glyph="&#xE769;" FontSize="18" />
+                                </ToggleButton>
+                                <TextBlock Text="hold" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                            <StackPanel Spacing="6">
+                                <Button x:Name="AudioButton" Width="56" Height="56" CornerRadius="28" Click="Audio_Click" AutomationProperties.Name="Switch audio">
+                                    <FontIcon x:Name="AudioGlyph" Glyph="&#xE8EA;" FontSize="18" />
+                                </Button>
+                                <TextBlock x:Name="AudioLabel" Text="use phone" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                            <StackPanel Spacing="6">
+                                <Button Width="56" Height="56" Style="{StaticResource AccentCircleButtonStyle}" Background="{StaticResource CallEndBrush}"
+                                        BorderBrush="{StaticResource CallEndBrush}" FontSize="20" Content="&#xE778;" Click="End_Click" AutomationProperties.Name="End call" />
+                                <TextBlock Text="end" HorizontalAlignment="Center" Foreground="White" FontSize="12" />
+                            </StackPanel>
+                        </StackPanel>
+                    </StackPanel>
+                </Grid>
+            </Grid>
+
+            <!-- Contact or call detail -->
+            <ScrollViewer x:Name="ContactPanel" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="64,48,40,40" Spacing="20" MaxWidth="560" HorizontalAlignment="Left">
+                    <Grid Width="120" Height="120" HorizontalAlignment="Left" x:Name="ContactTile">
+                        <TextBlock x:Name="ContactInitials" Foreground="White" FontFamily="{StaticResource MetroDisplayFont}" FontSize="48" FontWeight="Light"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <FontIcon x:Name="ContactPersonIcon" Glyph="&#xE77B;" Foreground="White" FontSize="48" Visibility="Collapsed" />
+                        <Image x:Name="ContactPhoto" Stretch="UniformToFill" />
+                    </Grid>
+                    <TextBlock x:Name="ContactName" Style="{StaticResource MetroHeaderText}" FontSize="40" LineHeight="46" TextWrapping="Wrap" />
+                    <ItemsControl x:Name="ContactNumbers" IsTabStop="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><StackPanel Spacing="10" /></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                    </ItemsControl>
+                    <TextBlock x:Name="ContactHistoryHeader" Text="history" Style="{StaticResource MetroSubheaderText}" FontSize="22" Margin="0,10,0,0" />
+                    <ItemsControl x:Name="ContactHistory" IsTabStop="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><StackPanel Spacing="6" /></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                    </ItemsControl>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+    </Grid>
+</UserControl>
