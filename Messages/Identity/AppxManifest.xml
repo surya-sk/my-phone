@@ -14,7 +14,7 @@
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:uap13="http://schemas.microsoft.com/appx/manifest/uap/windows10/13"
   IgnorableNamespaces="uap uap10 rescap desktop com uap13">
-  <Identity Name="NativeMessages.App" Publisher="CN=NativeMessages" Version="1.4.0.0" ProcessorArchitecture="x64" />
+  <Identity Name="NativeMessages.App" Publisher="CN=NativeMessages" Version="1.4.1.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>My Phone</DisplayName>
     <PublisherDisplayName>My Phone</PublisherDisplayName>
