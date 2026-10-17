@@ -104,7 +104,9 @@ type APIOptions struct {
 	MarkGoogleAuthExpired func(error) bool
 	ReconnectGoogle       func() error
 	// ActivateGoogle makes this the active Google Messages session ("Use here").
-	ActivateGoogle        func() error
+	ActivateGoogle func() error
+	// PollGoogle checks the phone for conversations newer than the stored copy.
+	PollGoogle            func() bool
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
 	ConnectWhatsApp       func() error
@@ -2752,6 +2754,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		publishStatus(currentConnected())
 		writeJSON(w, statusPayload(currentConnected()))
+	})
+
+	// Ask the phone for anything newer than the stored copy. Works whether or not this
+	// session is the one Google pushes live messages to.
+	mux.HandleFunc("/api/google/poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.PollGoogle == nil {
+			httpError(w, "google poll unavailable", 501)
+			return
+		}
+		writeJSON(w, map[string]bool{"started": opts.PollGoogle()})
 	})
 
 	mux.HandleFunc("/api/whatsapp/status", func(w http.ResponseWriter, r *http.Request) {

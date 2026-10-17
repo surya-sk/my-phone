@@ -151,7 +151,11 @@ public sealed partial class MainWindow : Window
         Root.KeyboardAcceleratorPlacementMode = KeyboardAcceleratorPlacementMode.Hidden;
         Root.ActualThemeChanged += (_, _) => ApplyCaptionColors();
         ApplyCaptionColors();
-        _refreshTimer.Tick += async (_, _) => await RefreshAsync(includeThread: true);
+        _refreshTimer.Tick += async (_, _) =>
+        {
+            await PollPhoneIfDueAsync();
+            await RefreshAsync(includeThread: true);
+        };
         _typingTimer.Tick += (_, _) => { if (DateTimeOffset.UtcNow > _typingExpires) HideTyping(); };
         _searchTimer.Tick += async (_, _) => { _searchTimer.Stop(); await RunMessageSearchAsync(); };
         _statusTimer.Tick += (_, _) => { _statusTimer.Stop(); StatusBanner.Visibility = Visibility.Collapsed; };
@@ -348,7 +352,11 @@ public sealed partial class MainWindow : Window
         _windowActive = args.WindowActivationState != WindowActivationState.Deactivated;
         // Using My Phone on this PC means you want messages here. Don't wait for Google to say another
         // device took over (that notice can be missed); claim live delivery whenever the window is used.
-        if (_windowActive) _ = ActivateHereAsync(automatic: true);
+        if (_windowActive)
+        {
+            _ = ActivateHereAsync(automatic: true);
+            if (DateTimeOffset.UtcNow - _lastPoll > TimeSpan.FromSeconds(10)) _ = PollPhoneIfDueAsync(force: true);
+        }
         if (_windowActive && _selected is not null)
         {
             App.Current.ClearConversationNotifications(_selected.Id);
@@ -669,6 +677,22 @@ public sealed partial class MainWindow : Window
     }
 
     private DateTimeOffset _lastCatchUp = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastPoll = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// Google pushes live messages to only one linked PC at a time, but the phone still answers the
+    /// others. So every PC asks the phone for anything new: every 30 seconds while in use, every 90
+    /// in the background. The PC that has live delivery gets messages instantly; the rest within a poll.
+    /// </summary>
+    private async Task PollPhoneIfDueAsync(bool force = false)
+    {
+        if (!_inboxReady) return;
+        var interval = TimeSpan.FromSeconds(_windowActive ? 30 : 90);
+        if (!force && DateTimeOffset.UtcNow - _lastPoll < interval) return;
+        _lastPoll = DateTimeOffset.UtcNow;
+        try { await _client.PollAsync(); }
+        catch (Exception ex) { Log.Write($"Polling the phone failed: {ex.Message}"); }
+    }
 
     /// <summary>Asks the phone for everything since a day before the newest message here (at most two weeks).</summary>
     private async Task CatchUpAsync()

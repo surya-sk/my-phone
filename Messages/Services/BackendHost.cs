@@ -85,7 +85,7 @@ public sealed class BackendHost : IDisposable
     // Backend lines about which device gets live messages, and about the connection itself, go to
     // app.log so a silent PC can be diagnosed. Only these lines: others can carry numbers or text.
     private static readonly string[] SessionKeywords =
-        { "inactive", "active session", "setactive", "browser", "logged out", "loggedout", "listen", "disconnect", "reconnect", "pair" };
+        { "inactive", "active session", "setactive", "browser", "logged out", "loggedout", "listen", "disconnect", "reconnect", "pair", "poll found" };
 
     private void Record(string line)
     {

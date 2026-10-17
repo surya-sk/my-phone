@@ -730,6 +730,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				MarkGoogleAuthExpired: markGoogleAuthExpired,
 				ReconnectGoogle:       reconnectGoogle,
 				ActivateGoogle:        a.ActivateGoogleSession,
+				PollGoogle:            a.PollRecentGoogle,
 				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
 				ConnectWhatsApp:       connectWhatsApp,

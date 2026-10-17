@@ -50,6 +50,14 @@ public sealed class OpenMessageClient : IDisposable
         await EnsureSuccessAsync(response);
     }
 
+    /// <summary>Asks the phone for anything newer than this PC has. Works even when another linked PC
+    /// is the one Google pushes live messages to, so every PC stays current.</summary>
+    public async Task PollAsync()
+    {
+        using var response = await _http.PostAsync("api/google/poll", null);
+        await EnsureSuccessAsync(response);
+    }
+
     public async Task<IReadOnlyList<Conversation>> GetConversationsAsync()
     {
         using var response = await _http.GetAsync("api/conversations?limit=500");
