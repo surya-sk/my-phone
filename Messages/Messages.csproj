@@ -29,6 +29,5 @@
     <!-- Explorer reads the identity's resource index from the exe folder; without it the taskbar icon is blank.
          WinUI's own index is Messages.pri, so this name is free. Regenerate with makepri after changing logos. -->
     <Content Include="Identity\resources.pri" Link="resources.pri" CopyToOutputDirectory="PreserveNewest" />
-    <PackageReference Include="QRCoder" Version="1.6.0" />
   </ItemGroup>
 </Project>

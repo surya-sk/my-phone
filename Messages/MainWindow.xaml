@@ -385,48 +385,18 @@
             <StackPanel MaxWidth="760" HorizontalAlignment="Left" Margin="56,24,40,40" Spacing="22">
                 <StackPanel Spacing="10">
                     <TextBlock Text="connect your phone" Style="{StaticResource MetroHeaderText}" FontSize="52" LineHeight="56" />
-                    <TextBlock Text="Scan a code with Google Messages on your phone. Your phone keeps sending RCS and SMS; this PC shows them."
+                    <TextBlock Text="Sign in with the Google account Google Messages uses on your phone. Your phone keeps sending RCS and SMS; this PC shows them."
                                TextWrapping="Wrap" FontSize="16" Opacity="0.72" />
                 </StackPanel>
-                <Grid x:Name="QrPairingPanel" ColumnSpacing="32" RowSpacing="18">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <!-- Scanners need dark modules on a light field, so the code keeps a white plate in both themes. -->
-                    <Grid Width="248" Height="248" Background="White" Padding="14" VerticalAlignment="Top">
-                        <Image x:Name="QrImage" Stretch="Uniform" AutomationProperties.Name="Pairing QR code" />
-                        <ProgressRing x:Name="QrProgress" IsActive="False" Width="36" Height="36" Foreground="#FF1F1F1F" />
-                        <Button x:Name="QrRetry" Content="show a new code" Click="QrRetry_Click" Visibility="Collapsed"
-                                HorizontalAlignment="Center" VerticalAlignment="Center" RequestedTheme="Light" />
-                    </Grid>
-                    <StackPanel Grid.Column="1" Spacing="14" VerticalAlignment="Top">
-                        <ItemsControl x:Name="QrSteps" IsTabStop="False">
-                            <ItemsControl.ItemsPanel>
-                                <ItemsPanelTemplate><StackPanel Spacing="14" /></ItemsPanelTemplate>
-                            </ItemsControl.ItemsPanel>
-                        </ItemsControl>
-                        <TextBlock x:Name="QrStatus" TextWrapping="Wrap" Opacity="0.72" />
-                        <HyperlinkButton Content="use my Google account instead" Click="ShowAccountPairing_Click" Padding="0" />
-                    </StackPanel>
-                </Grid>
-                <StackPanel x:Name="AccountPairingPanel" Spacing="22" Visibility="Collapsed">
-                <HyperlinkButton Content="scan a QR code instead" Click="ShowQrPairing_Click" Padding="0" />
                 <ItemsControl x:Name="PairingSteps" IsTabStop="False">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate><StackPanel Spacing="14" /></ItemsPanelTemplate>
                     </ItemsControl.ItemsPanel>
                 </ItemsControl>
-                <StackPanel Orientation="Horizontal" Spacing="10">
-                    <ComboBox x:Name="PairingBrowser" Header="browser for pairing" MinWidth="150">
-                        <ComboBoxItem Content="Firefox" Tag="firefox" />
-                        <ComboBoxItem Content="Chrome" Tag="chrome" />
-                        <ComboBoxItem Content="Edge" Tag="edge" />
-                    </ComboBox>
-                    <Button Content="open Google sign-in" Click="OpenSignIn_Click" Padding="18,8" VerticalAlignment="Bottom" />
+                <StackPanel Orientation="Horizontal" Spacing="16">
+                    <Button x:Name="SignInButton" Content="sign in with Google" Click="SignIn_Click" Style="{StaticResource AccentButtonStyle}" Padding="22,8" />
+                    <ProgressRing x:Name="PairProgress" IsActive="False" Width="24" Height="24" />
                 </StackPanel>
-                <TextBox x:Name="CookieInput" Header="paste the copied cURL command (Ctrl+V)" PlaceholderText="curl 'https://messages.google.com/web/config' ..."
-                         AcceptsReturn="True" TextWrapping="Wrap" Height="110" FontFamily="Cascadia Mono, Consolas" FontSize="12" />
                 <Grid x:Name="EmojiPanel" Visibility="Collapsed" ColumnSpacing="20">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
@@ -438,16 +408,26 @@
                     </Grid>
                     <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="6">
                         <TextBlock Text="tap this emoji on your phone" Style="{StaticResource MetroSubheaderText}" FontSize="26" TextWrapping="Wrap" />
-                        <TextBlock Text="Google Messages → account menu → Device pairing" Opacity="0.7" TextWrapping="Wrap" />
+                        <TextBlock Text="Google Messages shows a pairing prompt. If it doesn't, open Google Messages → profile picture → Device pairing."
+                                   Opacity="0.7" TextWrapping="Wrap" />
                     </StackPanel>
                 </Grid>
-                <StackPanel Orientation="Horizontal" Spacing="16">
-                    <Button x:Name="PairButton" Content="pair phone" Click="Pair_Click" Style="{StaticResource AccentButtonStyle}" Padding="22,8" />
-                    <ProgressRing x:Name="PairProgress" IsActive="False" Width="24" Height="24" />
-                </StackPanel>
                 <TextBlock x:Name="PairStatus" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-                <TextBlock Text="The command contains sensitive Google cookies. It goes only to the local pairing process and the box is cleared after you submit it."
-                           FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
+
+                <!-- Fallback when Google refuses sign-in inside the app: a private browser window and a copied request. -->
+                <HyperlinkButton x:Name="BrowserFallbackLink" Content="sign in with a browser instead" Click="ShowBrowserFallback_Click" Padding="0" />
+                <StackPanel x:Name="BrowserFallbackPanel" Spacing="16" Visibility="Collapsed">
+                    <ItemsControl x:Name="FallbackSteps" IsTabStop="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><StackPanel Spacing="14" /></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                    </ItemsControl>
+                    <Button Content="open a private browser window" Click="OpenPrivateBrowser_Click" Padding="18,8" />
+                    <TextBox x:Name="CookieInput" Header="paste the copied request (Ctrl+V)" PlaceholderText="curl 'https://messages.google.com/web/config' ..."
+                             AcceptsReturn="True" TextWrapping="Wrap" Height="110" FontFamily="Cascadia Mono, Consolas" FontSize="12" />
+                    <Button x:Name="PairButton" Content="pair phone" Click="Pair_Click" Padding="22,8" />
+                    <TextBlock Text="The request contains your Google sign-in cookies. It goes only to the pairing process on this PC, and the box is cleared after you submit it."
+                               FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
                 </StackPanel>
             </StackPanel>
         </ScrollViewer>

@@ -7,8 +7,9 @@ namespace Messages.Services;
 public sealed class BackendHost : IDisposable
 {
     public const int Port = 17077;
-    public static string DataDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NativeMessages");
+    // MYPHONE_DATA_DIR points a test copy at a separate folder so it can't touch the real pairing.
+    public static string DataDirectory => Environment.GetEnvironmentVariable("MYPHONE_DATA_DIR") is { Length: > 0 } dir ? dir
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NativeMessages");
     public static string SessionPath => Path.Combine(DataDirectory, "session.json");
     public static string TokenPath => Path.Combine(DataDirectory, "control.token");
     public static string ExecutablePath => Path.Combine(AppContext.BaseDirectory, "Backend", "openmessage.exe");
@@ -40,30 +41,6 @@ public sealed class BackendHost : IDisposable
         if (!HasSession) throw new InvalidOperationException("Pairing finished without a saved session.");
     }
 
-    /// <summary>Pairs by QR code: Google Messages on the phone scans it under Device pairing. The backend
-    /// prints a fresh pairing URL about every 30 seconds; each one is passed to <paramref name="onCode"/>.</summary>
-    public async Task PairWithQrAsync(Action<string> onCode, CancellationToken cancellationToken = default)
-    {
-        if (!File.Exists(ExecutablePath)) throw new FileNotFoundException("RCS backend is missing", ExecutablePath);
-        Directory.CreateDirectory(DataDirectory);
-        using var process = CreateProcess("pair");
-        if (!process.Start()) throw new InvalidOperationException("Could not start pairing.");
-        ChildProcessJob.Attach(process);
-        process.StandardInput.Close();
-        using var kill = cancellationToken.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } });
-        var errorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
-        while (await process.StandardOutput.ReadLineAsync(CancellationToken.None) is { } line)
-            if (line.StartsWith("URL: ", StringComparison.Ordinal)) onCode(line[5..].Trim());
-        await process.WaitForExitAsync(CancellationToken.None);
-        cancellationToken.ThrowIfCancellationRequested();
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException(LastLine(await errorTask) ?? "Pairing stopped.");
-        if (!HasSession) throw new InvalidOperationException("Pairing finished without a saved session.");
-    }
-
-    private static string? LastLine(string text) =>
-        text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault();
-
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         if (!File.Exists(ExecutablePath)) throw new FileNotFoundException("RCS backend is missing", ExecutablePath);
@@ -75,13 +52,11 @@ public sealed class BackendHost : IDisposable
         ChildProcessJob.Attach(process);
         _ = Task.Run(async () =>
         {
-            while (await process.StandardOutput.ReadLineAsync() is { } line)
-                lock (_serverLog) _serverLog.AppendLine(line);
+            while (await process.StandardOutput.ReadLineAsync() is { } line) Record(line);
         });
         _ = Task.Run(async () =>
         {
-            while (await process.StandardError.ReadLineAsync() is { } line)
-                lock (_serverLog) _serverLog.AppendLine(line);
+            while (await process.StandardError.ReadLineAsync() is { } line) Record(line);
         });
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
         for (var attempt = 0; attempt < 60; attempt++)
@@ -105,6 +80,18 @@ public sealed class BackendHost : IDisposable
             await Task.Delay(250, cancellationToken);
         }
         throw new TimeoutException("RCS backend did not start. " + ServerLog());
+    }
+
+    // Backend lines about which device gets live messages, and about the connection itself, go to
+    // app.log so a silent PC can be diagnosed. Only these lines: others can carry numbers or text.
+    private static readonly string[] SessionKeywords =
+        { "inactive", "active session", "setactive", "browser", "logged out", "loggedout", "listen", "disconnect", "reconnect", "pair" };
+
+    private void Record(string line)
+    {
+        lock (_serverLog) _serverLog.AppendLine(line);
+        var lower = line.ToLowerInvariant();
+        if (SessionKeywords.Any(lower.Contains)) Log.Write("backend: " + (line.Length > 300 ? line[..300] : line));
     }
 
     private Process CreateProcess(string arguments)

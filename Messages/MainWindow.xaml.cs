@@ -92,7 +92,6 @@ public sealed partial class MainWindow : Window
     private string? _pendingSelectId;
     private string? _pendingJumpMessageId;
     private CancellationTokenSource? _eventsCts;
-    private CancellationTokenSource? _qrCts;
     private DateTimeOffset _typingExpires;
     private ScrollViewer? _messageScroller;
     private MediaPlayer? _audioPlayer;
@@ -122,11 +121,6 @@ public sealed partial class MainWindow : Window
         AppWindow.Resize(new SizeInt32((int)(1200 * scale), (int)(820 * scale)));
 
         BuildPairingSteps();
-        var savedBrowser = BrowserAuth.SavedBrowser();
-        PairingBrowser.SelectedItem = PairingBrowser.Items.OfType<ComboBoxItem>()
-            .FirstOrDefault(item => (string?)item.Tag == savedBrowser)
-            ?? PairingBrowser.Items.OfType<ComboBoxItem>()
-                .FirstOrDefault(item => item.Tag is string browser && BrowserAuth.IsInstalled(browser));
         UpdateFilterHeaders();
         AddAccelerator(VirtualKey.N, (_, _) => NewChat_Click(this, new RoutedEventArgs()));
         AddAccelerator(VirtualKey.F, (_, _) =>
@@ -182,7 +176,6 @@ public sealed partial class MainWindow : Window
         if (!_backend.HasSession)
         {
             SetConnection(null, "not paired");
-            StartQrPairing();
             return;
         }
         PairStatus.Text = "Starting your paired phone connection…";
@@ -218,20 +211,18 @@ public sealed partial class MainWindow : Window
 
     private void BuildPairingSteps()
     {
-        AddSteps(QrSteps, new[]
-        {
-            "On your phone, open Google Messages.",
-            "Tap your profile picture, then Device pairing → QR code scanner.",
-            "Point your phone at this code. My Phone opens your messages once it's scanned."
-        });
         AddSteps(PairingSteps, new[]
         {
-            "Choose your browser, then select open Google sign-in. Sign in with the account chosen in Google Messages on your phone. Keep this dedicated browser profile signed in so My Phone can renew its session.",
-            "When the browser reaches messages.google.com/web/config, press F12 and open the Network tab.",
-            "Press Ctrl+R to reload. Find the request named config whose URL contains messages.google.com/web/config.",
-            "Right-click that request. Edge: Copy → Copy as cURL (bash). Firefox: Copy → Copy as cURL.",
-            "Paste it below with Ctrl+V. It starts with curl and contains a Cookie header. Select pair phone.",
-            "On your phone open Google Messages → account menu → Device pairing, and tap the emoji shown here."
+            "Select sign in with Google. A private sign-in window opens; sign in with the account Google Messages uses on your phone.",
+            "The window closes by itself and an emoji appears here. Tap the same emoji on your phone.",
+            "Your conversations open here. If Google won't let you sign in in that window, use sign in with a browser instead."
+        });
+        AddSteps(FallbackSteps, new[]
+        {
+            "Select open a private browser window and sign in to Google there.",
+            "When it reaches messages.google.com/web/config, press F12, open the Network tab and press Ctrl+R.",
+            "Right-click the request named config → Copy → Copy as cURL. Paste it below and select pair phone.",
+            "Close the private window without signing out."
         });
     }
 
@@ -259,95 +250,52 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>Runs QR pairing until the phone scans a code, the codes run out, or the user leaves the QR view.</summary>
-    private async void StartQrPairing()
+    private async void SignIn_Click(object sender, RoutedEventArgs e)
     {
-        _qrCts?.Cancel();
-        var cts = _qrCts = new CancellationTokenSource(TimeSpan.FromMinutes(9));
-        QrImage.Source = null;
-        QrRetry.Visibility = Visibility.Collapsed;
-        QrProgress.IsActive = true;
-        QrStatus.Text = "Getting a pairing code…";
+        SignInButton.IsEnabled = false;
+        PairStatus.Text = "Sign in to Google in the window that opened.";
         try
         {
-            await _backend.PairWithQrAsync(url => DispatcherQueue.TryEnqueue(() =>
-            {
-                if (cts.IsCancellationRequested) return;
-                QrImage.Source = QrBitmap(url);
-                QrProgress.IsActive = false;
-                QrStatus.Text = "Waiting for your phone to scan the code…";
-            }), cts.Token);
-            QrStatus.Text = "Paired. Opening your messages…";
-            await ShowInboxAsync();
+            var cookies = await Views.SignInWindow.SignInAsync();
+            if (cookies is null) { PairStatus.Text = "Sign-in was closed before it finished."; return; }
+            await PairWithCookiesAsync(cookies);
         }
-        catch (Exception ex)
-        {
-            if (_qrCts != cts) return;  // Replaced by a newer attempt or by the account flow.
-            QrStatus.Text = ex is OperationCanceledException ? "The code expired." : ex.Message;
-            QrImage.Source = null;
-            QrRetry.Visibility = Visibility.Visible;
-        }
-        finally { if (_qrCts == cts) QrProgress.IsActive = false; }
+        catch (Exception ex) { PairStatus.Text = ex.Message; }
+        finally { SignInButton.IsEnabled = true; }
     }
 
-    private static Microsoft.UI.Xaml.Media.Imaging.BitmapImage QrBitmap(string text)
+    private void ShowBrowserFallback_Click(object sender, RoutedEventArgs e)
     {
-        using var generator = new QRCoder.QRCodeGenerator();
-        using var data = generator.CreateQrCode(text, QRCoder.QRCodeGenerator.ECCLevel.L);
-        var png = new QRCoder.PngByteQRCode(data).GetGraphic(8, drawQuietZones: false);
-        var bitmap = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage();
-        bitmap.SetSource(new MemoryStream(png).AsRandomAccessStream());
-        return bitmap;
+        BrowserFallbackPanel.Visibility = Visibility.Visible;
+        BrowserFallbackLink.Visibility = Visibility.Collapsed;
     }
 
-    private void QrRetry_Click(object sender, RoutedEventArgs e) => StartQrPairing();
-
-    private void ShowAccountPairing_Click(object sender, RoutedEventArgs e)
+    private void OpenPrivateBrowser_Click(object sender, RoutedEventArgs e)
     {
-        var cts = _qrCts;
-        _qrCts = null;
-        cts?.Cancel();
-        QrPairingPanel.Visibility = Visibility.Collapsed;
-        AccountPairingPanel.Visibility = Visibility.Visible;
-    }
-
-    private void ShowQrPairing_Click(object sender, RoutedEventArgs e)
-    {
-        AccountPairingPanel.Visibility = Visibility.Collapsed;
-        QrPairingPanel.Visibility = Visibility.Visible;
-        StartQrPairing();
-    }
-
-    private void OpenSignIn_Click(object sender, RoutedEventArgs e)
-    {
-        const string url = "https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config";
-        try
-        {
-            if (PairingBrowser.SelectedItem is not ComboBoxItem { Tag: string browser })
-                throw new InvalidOperationException("Choose an installed browser first.");
-            BrowserAuth.OpenSignIn(browser, url);
-        }
+        try { PrivateBrowser.Open("https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config"); }
         catch (Exception ex) { PairStatus.Text = ex.Message; }
     }
 
     private async void Pair_Click(object sender, RoutedEventArgs e)
     {
-        if (PairingBrowser.SelectedItem is not ComboBoxItem { Tag: string browser })
-        {
-            PairStatus.Text = "Choose the browser you used for pairing first.";
-            return;
-        }
         var cookies = CookieInput.Text.Trim();
-        if (cookies.Length == 0) { PairStatus.Text = "Paste the copied browser request first."; return; }
+        if (cookies.Length == 0) { PairStatus.Text = "Paste the copied request first."; return; }
         CookieInput.Text = "";
         PairButton.IsEnabled = false;
+        try { await PairWithCookiesAsync(cookies); }
+        catch (Exception ex) { PairStatus.Text = ex.Message; }
+        finally { PairButton.IsEnabled = true; }
+    }
+
+    /// <summary>Pairs with Google Messages using signed-in Google cookies (a JSON map or a copied cURL request).</summary>
+    private async Task PairWithCookiesAsync(string cookies)
+    {
         EmojiPanel.Visibility = Visibility.Collapsed;
         EmojiText.Text = "";
         PairProgress.IsActive = true;
         PairStatus.Text = "Waiting for Google Messages…";
         try
         {
-            BrowserAuth.SaveBrowser(browser);
             await _backend.PairAsync(cookies, emoji => DispatcherQueue.TryEnqueue(() =>
             {
                 EmojiText.Text = emoji;
@@ -355,11 +303,10 @@ public sealed partial class MainWindow : Window
                 PairStatus.Text = "Tap the matching emoji on your phone.";
                 PairingPanel.ChangeView(null, PairingPanel.ScrollableHeight, null);
             }));
-            PairStatus.Text = "Paired. Starting My Phone…";
+            PairStatus.Text = "Paired. Opening your messages…";
             await ShowInboxAsync();
         }
-        catch (Exception ex) { PairStatus.Text = ex.Message; }
-        finally { PairProgress.IsActive = false; PairButton.IsEnabled = true; }
+        finally { PairProgress.IsActive = false; }
     }
 
     private async void PairAgain_Click(object sender, RoutedEventArgs e)
@@ -390,18 +337,18 @@ public sealed partial class MainWindow : Window
         EmojiPanel.Visibility = Visibility.Collapsed;
         PairStatus.Text = "Pair this PC with your phone again.";
         InboxPanel.Visibility = Visibility.Collapsed;
+        CallsPanel.Visibility = Visibility.Collapsed;
         PairingPanel.Visibility = Visibility.Visible;
         SetConnection(null, "not paired");
         UpdateBadge();
-        AccountPairingPanel.Visibility = Visibility.Collapsed;
-        QrPairingPanel.Visibility = Visibility.Visible;
-        StartQrPairing();
     }
 
     private void OnActivated(object sender, WindowActivatedEventArgs args)
     {
         _windowActive = args.WindowActivationState != WindowActivationState.Deactivated;
-        if (_windowActive && _sessionInactive) _ = ActivateHereAsync(automatic: true);
+        // Using My Phone on this PC means you want messages here. Don't wait for Google to say another
+        // device took over (that notice can be missed); claim live delivery whenever the window is used.
+        if (_windowActive) _ = ActivateHereAsync(automatic: true);
         if (_windowActive && _selected is not null)
         {
             App.Current.ClearConversationNotifications(_selected.Id);
@@ -662,7 +609,9 @@ public sealed partial class MainWindow : Window
 
     private void ApplyStatus(PhoneStatus status)
     {
-        _sessionInactive = status.Connected && status.SessionInactive;
+        var inactive = status.Connected && status.SessionInactive;
+        if (inactive != _sessionInactive) Log.Write(inactive ? "Google says another device is active; live messages stopped here." : "This device is the active one again.");
+        _sessionInactive = inactive;
         if (_sessionInactive) SetConnection(false, "active on another device");
         else if (status.Connected) SetConnection(true, null);
         else if (status.SignInExpired) SetConnection(false, "Google sign-in expired");
@@ -676,7 +625,7 @@ public sealed partial class MainWindow : Window
         }
         else
         {
-            AuthBannerText.Text = "Messages couldn't renew this connection. Sign in using the selected browser, then pair again if needed.";
+            AuthBannerText.Text = "Google signed this PC out of Google Messages. Pair again to reconnect.";
             AuthBannerAction.Content = "pair again";
         }
         ToolTipService.SetToolTip(ConnectionText, status.LastError.Length > 0 ? status.LastError : null);
@@ -697,23 +646,39 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private async Task ActivateHereAsync(bool automatic)
     {
-        if (_activating) return;
-        if (automatic && DateTimeOffset.UtcNow - _lastActivateAttempt < TimeSpan.FromMinutes(2)) return;
+        if (_activating || !_inboxReady) return;
+        if (automatic && DateTimeOffset.UtcNow - _lastActivateAttempt < TimeSpan.FromSeconds(60)) return;
         _activating = true;
         _lastActivateAttempt = DateTimeOffset.UtcNow;
+        var wasInactive = _sessionInactive;
         try
         {
             await _client.ActivateAsync();
-            Log.Write($"Session activated on this device ({(automatic ? "window focused" : "user")}).");
+            Log.Write($"Took live messages for this PC ({(automatic ? "window focused" : "user")}, was {(wasInactive ? "inactive" : "active")}).");
             if (!automatic) ShowStatus("My Phone is active on this PC again. Catching up…");
+            // Another PC may have had the messages meanwhile; pull what arrived since this one last heard.
+            if (wasInactive || DateTimeOffset.UtcNow - _lastCatchUp > TimeSpan.FromMinutes(10)) await CatchUpAsync();
         }
         catch (Exception ex)
         {
-            Log.Write($"Activate failed: {ex.Message}");
+            Log.Write($"Taking live messages failed: {ex.Message}");
             if (!automatic) ShowStatus($"Couldn't switch Google Messages to this PC: {ex.Message}");
         }
         finally { _activating = false; }
         await RefreshAsync(includeThread: true);
+    }
+
+    private DateTimeOffset _lastCatchUp = DateTimeOffset.MinValue;
+
+    /// <summary>Asks the phone for everything since a day before the newest message here (at most two weeks).</summary>
+    private async Task CatchUpAsync()
+    {
+        _lastCatchUp = DateTimeOffset.UtcNow;
+        var newest = _allConversations.Count > 0 ? _allConversations.Max(c => c.TimestampMs) : 0;
+        var since = newest > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(newest).AddDays(-1) : DateTimeOffset.UtcNow.AddDays(-3);
+        if (since < DateTimeOffset.UtcNow.AddDays(-14)) since = DateTimeOffset.UtcNow.AddDays(-14);
+        await _client.SyncSinceAsync(since);
+        Log.Write($"Catch-up sync requested from {since:u}.");
     }
 
     private void SetConnection(bool? connected, string? text)
